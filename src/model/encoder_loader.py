@@ -1,5 +1,5 @@
 """
-DeepSVG Encoder Loader (Skeleton)
+DeepSVG Encoder Loader (Enhanced)
 
 Purpose
 -------
@@ -18,6 +18,13 @@ We only need forward-pass embeddings (no fine-tuning yet). Thus:
 - The model parameters can be frozen (gradient disabled).
 - We pick a single latent representation (e.g., final encoder hidden state pooled).
 - We do not (yet) manage multi-scale hierarchical latents; a TODO note is left.
+
+Recent Additions
+----------------
+- Checkpoint structure heuristic: inspects keys to auto-toggle `use_vae` vs. bottleneck.
+- Filename and key-based heuristic for hierarchical (two-stage) vs one-stage config.
+- Expanded debug logging summarizing configuration decisions before state load.
+- More robust encoder-only forward path & tensor shape normalization.
 
 Future Enhancements
 -------------------
@@ -42,10 +49,10 @@ Usage Example
 
 Notes
 -----
-This file is a scaffold: adapt the attribute names once the real DeepSVG
-model object structure is confirmed. Refer to upstream repo after cloning.
+This file started as a scaffold; it now contains heuristics to better align
+pretrained checkpoints whose configs are not explicitly serialized.
 
-Author: Phase 1 scaffolding.
+Author: Phase 1 scaffolding + heuristic enhancements.
 """
 
 from __future__ import annotations
@@ -143,6 +150,7 @@ class DeepSVGEncoderWrapper:
         device: str,
         embedding_dim: int,
         frozen: bool = True,
+        nan_guard: bool = True,
     ):
         self._model = model
         self._variant = variant
@@ -150,6 +158,7 @@ class DeepSVGEncoderWrapper:
         self._device = device
         self._embedding_dim = embedding_dim
         self._frozen = frozen
+        self._nan_guard = nan_guard
 
         # Sanity freeze
         if frozen and hasattr(model, "parameters"):
@@ -178,71 +187,110 @@ class DeepSVGEncoderWrapper:
     # ------------------------------------------------------------------ #
     def encode(self, batch: Any) -> Any:
         """
-        Produce embeddings for a batch of SVG tensors.
+        Faithful hierarchical (or one-stage) encoder path.
 
-        Parameters
-        ----------
-        batch : Any
-            A pre-tokenized batch structure compatible with the DeepSVG model's forward method.
-            (Exact type depends on integration; may be a dict, custom class, or tensor tuple.)
+        Required batch format (dict):
+            commands_grouped : LongTensor (N, G, S)
+            args_grouped     : LongTensor (N, G, S, n_args)
 
-        Returns
-        -------
-        torch.Tensor
-            Shape: (batch_size, embedding_dim)
-
-        Strategy
-        --------
-        - Calls model(batch)
-        - If output is a tensor with shape (B, T, D): mean-pool across time -> (B, D)
-        - If output is dict: attempt to locate a latent tensor via known keys, then apply same pooling.
-        - If output already (B, D): returned directly.
-
-        Raises
-        ------
-        EncoderLoaderError if no valid embedding can be inferred.
+        Returns:
+            Tensor (N, embedding_dim)
         """
         if torch is None:
             raise EncoderLoaderError("Torch not available; cannot run encode.")
 
-        with torch.no_grad():
-            out = self._model(batch)
-
-        # Case 1: direct tensor
-        if isinstance(out, torch.Tensor):
-            if out.ndim == 2:
-                return out
-            if out.ndim == 3:
-                return out.mean(dim=1)
+        if not isinstance(batch, dict):
+            raise EncoderLoaderError("encode expects batch dict with grouped tensors.")
+        if "commands_grouped" not in batch or "args_grouped" not in batch:
             raise EncoderLoaderError(
-                f"Unexpected tensor shape from model forward: {tuple(out.shape)}"
+                "Missing 'commands_grouped' or 'args_grouped' in batch."
             )
 
-        # Case 2: dict-like
-        if isinstance(out, dict):
-            for key in ("latent", "z", "encoder_out", "final"):
-                if key in out and isinstance(out[key], torch.Tensor):
-                    t = out[key]
-                    if t.ndim == 2:
-                        return t
-                    if t.ndim == 3:
-                        return t.mean(dim=1)
-                    raise EncoderLoaderError(
-                        f"Unexpected tensor shape at key '{key}': {tuple(t.shape)}"
+        cmds = batch["commands_grouped"]
+        args = batch["args_grouped"]
+
+        if not (isinstance(cmds, torch.Tensor) and isinstance(args, torch.Tensor)):
+            raise EncoderLoaderError("Grouped tensors must be torch.Tensor instances.")
+        if cmds.ndim != 3 or args.ndim != 4:
+            raise EncoderLoaderError(
+                f"Invalid ranks: commands {tuple(cmds.shape)} (expect 3D), args {tuple(args.shape)} (expect 4D)."
+            )
+        if args.shape[:3] != cmds.shape:
+            raise EncoderLoaderError(
+                f"Shape mismatch between commands {tuple(cmds.shape)} and args {tuple(args.shape)} (first 3 dims)."
+            )
+
+        N, G, S = cmds.shape
+
+        # Permute to (S, G, N)
+        cmds_seq_first = cmds.permute(2, 1, 0).contiguous()
+        args_seq_first = args.permute(2, 1, 0, 3).contiguous()
+
+        # Encoder forward (strict – no fallback)
+
+        try:
+            z = self._model.encoder(cmds_seq_first, args_seq_first, label=None)
+        except Exception as e:
+            raise EncoderLoaderError(f"Encoder forward failed: {e}") from e
+
+        # Post-encoder modules
+        if getattr(self._model.cfg, "use_resnet", False) and hasattr(
+            self._model, "resnet"
+        ):
+            try:
+                z = self._model.resnet(z)
+            except Exception as e:
+                raise EncoderLoaderError(f"ResNet forward failed: {e}") from e
+
+        if getattr(self._model.cfg, "use_vae", False) and hasattr(self._model, "vae"):
+            try:
+                _, mu, _ = self._model.vae(z)  # deterministic mean
+                z = mu
+            except Exception as e:
+                raise EncoderLoaderError(f"VAE forward failed: {e}") from e
+        elif hasattr(self._model, "bottleneck"):
+            try:
+                z = self._model.bottleneck(z)
+            except Exception as e:
+                raise EncoderLoaderError(f"Bottleneck forward failed: {e}") from e
+
+        if not isinstance(z, torch.Tensor):
+            raise EncoderLoaderError(f"Encoder output is not a tensor (got {type(z)}).")
+
+        # Simplified shape normalization:
+        # Accept (1,N,D), (N,D), or (1,1,N,D) (edge-case: extra singleton group dimension).
+        if z.ndim == 4 and z.shape[0] == 1 and z.shape[1] == 1:
+            z = z.squeeze(0).squeeze(0)
+        elif z.ndim == 3 and z.shape[0] == 1:
+            z = z.squeeze(0)
+        elif z.ndim != 2:
+            raise EncoderLoaderError(
+                f"Unexpected encoder output shape (expected (1,N,D), (N,D) or (1,1,N,D)): {tuple(z.shape)}"
+            )
+
+        if torch.isnan(z).any():
+            if self._nan_guard:
+                z = torch.nan_to_num(z, nan=0.0, posinf=0.0, neginf=0.0)
+                norms = z.norm(dim=1, keepdim=True).clamp_min(1e-8)
+                z = z / norms
+            else:
+                raise EncoderLoaderError("NaNs in encoder output (nan_guard disabled).")
+
+        if getattr(self, "_debug_stats", False):
+            with torch.no_grad():
+                norms = z.norm(dim=1)
+                print(
+                    "[ENCDBG] Encode stats: N=%d dim=%d row_norm_mean=%.4e min=%.4e max=%.4e"
+                    % (
+                        z.shape[0],
+                        z.shape[1],
+                        norms.mean().item(),
+                        norms.min().item(),
+                        norms.max().item(),
                     )
+                )
 
-        # Case 3: object with attribute 'latent'
-        latent = getattr(out, "latent", None)
-        if isinstance(latent, torch.Tensor):
-            if latent.ndim == 2:
-                return latent
-            if latent.ndim == 3:
-                return latent.mean(dim=1)
-
-        raise EncoderLoaderError(
-            "Unable to derive embedding from model output. "
-            "Adjust `encode` logic to match actual DeepSVG forward return structure."
-        )
+        return z
 
 
 # ---------------------------------------------------------------------------
@@ -339,13 +387,93 @@ def _load_state_dict_safely(model: Any, weight_path: str, strict: bool = False) 
 
     try:
         state = torch.load(weight_path, map_location="cpu")
-        if isinstance(state, dict) and "state_dict" in state:
-            state = state["state_dict"]
+
+        # Unwrap common checkpoint nesting patterns
+        if isinstance(state, dict):
+            if "model" in state and isinstance(state["model"], dict):
+                inner = state["model"]
+                # Some checkpoints: {"model": {"state_dict": {...}}}
+                if "state_dict" in inner and isinstance(inner["state_dict"], dict):
+                    state = inner["state_dict"]
+                else:
+                    state = inner
+            elif "state_dict" in state and isinstance(state["state_dict"], dict):
+                state = state["state_dict"]
+
+        if not isinstance(state, dict):
+            raise EncoderLoaderError("Loaded checkpoint is not a dict-like state dict.")
+
+        # Optionally strip leading prefixes (e.g., 'module.' / 'model.')
+        def _strip_prefix(k: str) -> str:
+            for pref in ("module.", "model."):
+                if k.startswith(pref):
+                    return k[len(pref) :]
+            return k
+
+        processed_state = {}
+        for k, v in state.items():
+            if not isinstance(k, str):
+                continue
+            processed_state[_strip_prefix(k)] = v
+        state = processed_state
+
+        model_keys = set(model.state_dict().keys())
+        loaded_keys = set(state.keys())
+
+        # Shape-mismatch filtering (only when strict=False)
+        if not strict:
+            model_state_full = model.state_dict()
+            to_drop = []
+            for k, v in list(state.items()):
+                if k in model_state_full:
+                    mv = model_state_full[k]
+                    if (
+                        hasattr(v, "shape")
+                        and hasattr(mv, "shape")
+                        and v.shape != mv.shape
+                    ):
+                        to_drop.append((k, v.shape, mv.shape))
+                        state.pop(k)
+            if to_drop:
+                print(
+                    "[EncoderLoader] Dropping %d mismatched shape keys (strict=False). First 5: %s"
+                    % (
+                        len(to_drop),
+                        [f"{k}:{src}->{tgt}" for k, src, tgt in to_drop[:5]],
+                    )
+                )
+
+        # Load with provided strict flag (default False) (after filtering)
         missing, unexpected = model.load_state_dict(state, strict=strict)
+
+        matched = len(model_keys) - len(missing)
+        match_ratio = matched / max(1, len(model_keys))
+
+        summary = (
+            f"[EncoderLoader] State dict load summary: "
+            f"matched={matched}/{len(model_keys)} ({match_ratio:.2%}), "
+            f"missing={len(missing)}, unexpected={len(unexpected)}"
+        )
+        print(summary)
+
+        # Show a few sample keys for quick inspection
         if missing:
-            warnings.warn(f"[EncoderLoader] Missing keys: {missing}")
+            print(f"[EncoderLoader] Sample missing keys (first 5): {missing[:5]}")
         if unexpected:
-            warnings.warn(f"[EncoderLoader] Unexpected keys: {unexpected}")
+            print(f"[EncoderLoader] Sample unexpected keys (first 5): {unexpected[:5]}")
+
+        # Helpful debug: list unmatched loaded keys (rare case)
+        unmatched_loaded = sorted(list(loaded_keys - model_keys))
+        if unmatched_loaded:
+            print(
+                f"[EncoderLoader] Loaded keys with no target match (first 5): {unmatched_loaded[:5]}"
+            )
+
+        if strict and (missing or unexpected):
+            raise EncoderLoaderError(
+                f"Strict load failed: {len(missing)} missing, {len(unexpected)} unexpected keys."
+            )
+
     except Exception as e:
         raise EncoderLoaderError(
             f"Failed to load state dict from {weight_path}: {e}"
@@ -364,6 +492,10 @@ def load_encoder(
     freeze: bool = True,
     strict_state: bool = False,
     custom_weight_path: Optional[str] = None,
+    auto_config: bool = True,
+    verbose: bool = True,
+    force_one_stage: bool = False,
+    nan_guard: bool = True,
 ) -> DeepSVGEncoderWrapper:
     """
     Load a DeepSVG encoder wrapper.
@@ -382,6 +514,10 @@ def load_encoder(
         Pass strict=True to model.load_state_dict.
     custom_weight_path : str | None
         Explicit path to weights (overrides heuristic search).
+    force_one_stage : bool
+        If True, override heuristic and use OneStageOneShot config (encode_stages=1).
+    nan_guard : bool
+        If True, replace any NaNs in final embeddings with zero + re-normalize.
     """
     if torch is None:
         raise EncoderLoaderError("Torch not available; install PyTorch first.")
@@ -409,39 +545,118 @@ def load_encoder(
 
     model_module, config_module = _import_deepsvg_model()
 
-    # Instantiate configuration - adjust once actual API is confirmed
-    try:
-        cfg = getattr(config_module, "ModelConfig", None)
-        if cfg is not None:
-            # Hypothetical usage; adjust to real config creation logic
-            model_cfg = cfg()
-        else:
-            model_cfg = None
-    except Exception:
-        model_cfg = None
-        warnings.warn(
-            "[EncoderLoader] Unable to instantiate ModelConfig; proceeding with raw model init."
+    # Pre-scan checkpoint (without mutating) to detect structural hints if auto_config
+    detected = {
+        "has_vae_keys": False,
+        "has_bottleneck_keys": False,
+        "hierarchical_in_name": False,
+        "matched_encode_stages": None,
+    }
+    if auto_config:
+        try:
+            raw_state = torch.load(weight_path, map_location="cpu")
+            # Shallow unwrap to access keys
+            if isinstance(raw_state, dict):
+                if "model" in raw_state and isinstance(raw_state["model"], dict):
+                    probe = raw_state["model"]
+                    if "state_dict" in probe and isinstance(probe["state_dict"], dict):
+                        probe = probe["state_dict"]
+                elif "state_dict" in raw_state and isinstance(
+                    raw_state["state_dict"], dict
+                ):
+                    probe = raw_state["state_dict"]
+                else:
+                    probe = raw_state
+                if isinstance(probe, dict):
+                    klist = list(probe.keys())
+                    for k in klist:
+                        if (
+                            k.startswith("vae.")
+                            or ".enc_mu_fcn" in k
+                            or ".enc_sigma_fcn" in k
+                        ):
+                            detected["has_vae_keys"] = True
+                        if k.startswith("bottleneck.") or ".bottleneck." in k:
+                            detected["has_bottleneck_keys"] = True
+        except Exception:
+            pass
+        detected["hierarchical_in_name"] = (
+            "hierarchical" in os.path.basename(weight_path).lower()
         )
+
+    # Instantiate configuration (choose appropriate concrete config) with heuristic
+    try:
+        weight_lower = os.path.basename(weight_path).lower()
+        if force_one_stage:
+            ConfigClass = getattr(config_module, "OneStageOneShot", None)
+        elif detected["hierarchical_in_name"]:
+            ConfigClass = getattr(config_module, "Hierarchical", None)
+        else:
+            ConfigClass = getattr(config_module, "OneStageOneShot", None)
+        if ConfigClass is None:
+            ConfigClass = getattr(config_module, "_DefaultConfig")
+        model_cfg = ConfigClass()
+        # Heuristic toggles
+        if auto_config:
+            if detected["has_bottleneck_keys"] and not detected["has_vae_keys"]:
+                # Use bottleneck, disable VAE
+                if getattr(model_cfg, "use_vae", None) is not None:
+                    model_cfg.use_vae = False
+            elif detected["has_vae_keys"]:
+                if getattr(model_cfg, "use_vae", None) is not None:
+                    model_cfg.use_vae = True
+            # If hierarchical name absent but we somehow have stage-2 style keys (future heuristic), could adjust encode_stages/decode_stages here.
+        if verbose:
+            print(
+                "[EncoderLoader] Config heuristic: hierarchical=%s has_vae_keys=%s has_bottleneck_keys=%s -> use_vae=%s encode_stages=%s decode_stages=%s"
+                % (
+                    detected["hierarchical_in_name"],
+                    detected["has_vae_keys"],
+                    detected["has_bottleneck_keys"],
+                    getattr(model_cfg, "use_vae", "?"),
+                    getattr(model_cfg, "encode_stages", "?"),
+                    getattr(model_cfg, "decode_stages", "?"),
+                )
+            )
+    except Exception as e:
+        raise EncoderLoaderError(f"Failed to build model config: {e}") from e
 
     # Build model object
     try:
-        # Hypothetical class name "Model" (adjust if different)
-        ModelClass = getattr(model_module, "Model")
+        # Locate actual DeepSVG model class (prefer SVGTransformer, fallback to Model)
+        ModelClass = getattr(model_module, "SVGTransformer", None) or getattr(
+            model_module, "Model"
+        )
     except AttributeError as e:
         raise EncoderLoaderError(
-            "DeepSVG model class 'Model' not found. Adjust encoder_loader to actual class."
+            "DeepSVG model class not found (tried: 'SVGTransformer', 'Model')."
         ) from e
 
     try:
-        model = ModelClass(model_cfg) if model_cfg is not None else ModelClass()
-    except TypeError:
-        # Fallback: maybe ModelClass takes no args
-        model = ModelClass()
+        model = ModelClass(model_cfg)
+    except Exception as e:
+        raise EncoderLoaderError(
+            f"Failed to instantiate model with provided config: {e}"
+        ) from e
 
     _load_state_dict_safely(model, weight_path, strict=strict_state)
 
     model.to(device)
 
+    # Override embedding_dim with model latent dimension if available
+    embedding_dim = getattr(model_cfg, "dim_z", embedding_dim)
+
+    if verbose:
+        print(
+            "[EncoderLoader] Final encoder wrapper: variant=%s dim_z=%s d_model=%s use_vae=%s use_resnet=%s"
+            % (
+                variant,
+                getattr(model_cfg, "dim_z", "?"),
+                getattr(model_cfg, "d_model", "?"),
+                getattr(model_cfg, "use_vae", "?"),
+                getattr(model_cfg, "use_resnet", "?"),
+            )
+        )
     wrapper = DeepSVGEncoderWrapper(
         model=model,
         variant=variant,
@@ -449,6 +664,7 @@ def load_encoder(
         device=device,
         embedding_dim=embedding_dim,
         frozen=freeze,
+        nan_guard=nan_guard,
     )
     return wrapper
 

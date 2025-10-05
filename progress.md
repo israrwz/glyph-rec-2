@@ -155,6 +155,326 @@ In-Memory Index     Memory-Mapped Array (disk)
   
   Decision lock:
   - All Phase 1 embeddings will use norm_v2 unless a deliberate experiment requires norm_v1; any change triggers a new normalization_version tag.
+
+## 22. Model Integration Status (DeepSVG Encoder) – Current Findings (Updated)
+
+### 22.1 Repository Structure Clarification
+- The full DeepSVG source (including `model`, `svglib`, `utils`, `difflib`, etc.) resides under the nested path `deepsvg/deepsvg/`.
+- Path injection now standardized across scripts (`run_embed.py`, `debug_parse.py`, `similarity_eval.py`) so local repo usage requires no install step.
+
+### 22.2 Checkpoint Structure Issue (Resolved)
+- `hierarchical_ordered.pth.tar` wraps weights under a `"model"` key; loader now unwraps `"model"` and/or `"state_dict"` recursively.
+- Additional normalization of key prefixes (`module.` / `model.`) implemented.
+- Result: zero unexpected keys after heuristic alignment (see 22.11).
+
+### 22.3 Config / Architecture Mismatch (Mitigated via Heuristics)
+- Filename `"hierarchical"` triggers selection of `Hierarchical` config (encode_stages=2, decode_stages=2).
+- New heuristic scans checkpoint keys:
+  - Presence of `bottleneck.*` and absence of `vae.*` → enforce `use_vae=False`.
+  - Presence of `vae.` keys → enforce `use_vae=True`.
+- For the shipped hierarchical checkpoint: bottleneck present, VAE absent → auto sets `use_vae=False` (eliminating previous 4 missing + 2 unexpected keys).
+
+### 22.4 Embedding Extraction Failures (Root Causes & Fixes)
+Original failure (“All glyphs skipped”) traced to:
+1. `ContourCommand` lacked dataclass constructor → instantiation errors silently swallowed.
+2. Normalization expected `ContourCommandLike.replace_points`; ad‑hoc wrapper lacked this method.
+3. Lack of debug output hid exceptions.
+Fixes:
+- Added `@dataclass(frozen=True)` to `ContourCommand`.
+- Explicit conversion to `ContourCommandLike` prior to normalization.
+- Added batch-level debug logging and skip summaries.
+- Implemented encoder-only fast path; robust shape squeezing for (1,1,N,D) → (N,D).
+
+### 22.5 Normalization Strategy Alignment
+- Still using `norm_v2` (EM-scale, size-preserving, center, y-flip).
+- Width/height EM statistics logged per batch (useful for later size-token experiments).
+- Observed width_em range ~0.07–1.52 in small samples — indicates outliers; will revisit after larger run (potential mild global scale clamp).
+
+### 22.6 Risks (Re-evaluated)
+| Risk | Status | Mitigation |
+|------|--------|------------|
+| Unwrapped checkpoint `model` key | Resolved | Loader unwrap logic |
+| VAE vs bottleneck mismatch | Resolved | Auto-config heuristic |
+| Silent glyph parse errors | Mitigated | Verbose debug + failure IDs |
+| Arg tokenization mismatch | Open | Phase 2 authentic tokenizer plan |
+| Large coordinate magnitudes | Monitoring | Collect stats; consider global scale |
+| Hierarchical pooling ambiguity | Acceptable | Output shape normalized & validated |
+| All‑EOS group padding → attention NaNs | Resolved | Diagnosed root cause (all-masked attention rows); implemented dynamic group bucketing to eliminate zero-length columns |
+
+### 22.7 Immediate Next Steps (Actionable – Updated)
+- Add Section 24 (Hierarchical Faithful Embedding Pipeline Plan) implementing a fully repo-faithful DeepSVG preprocessing + hierarchical two-stage encoder path (replacing interim one-stage fallback).
+
+DONE:
+1. Loader unwrapping & safe state dict load w/ stats.
+2. Encoder-only path & deterministic latent (bottleneck).
+3. Verbose parse/normalize error diagnostics.
+4. State dict match ratio logging (now 100%).
+5. Embedding dimensionality assertion & shape normalization.
+6. Metadata capture (width_em, height_em).
+7. Similarity evaluation tooling (Section 23).
+8. Hierarchical NaN diagnosis (all‑EOS columns) + dynamic group bucketing implementation.
+9. Stability confirmation over 256 glyph sample (no NaNs; zero zero-norm rows post-bucketing).
+10. Removal of deep internal probe instrumentation (kept lightweight debug only).
+
+PENDING / UPCOMING:
+11. Larger-scale embedding run (≥1k–5k) & aggregate similarity metrics (cluster cohesion / separation).
+12. Intra/inter label distance tracking over bigger sample (persist summary stats).
+13. Memmap (or parquet / Arrow) persistence layer for scalable embedding storage.
+14. Optional global coordinate scale evaluation (decide after distribution analysis of larger run).
+15. Authentic DeepSVG argument tokenizer parity plan draft (Phase 2).
+16. Add group count distribution & per-bucket utilization reporting to progress logs.
+17. Baseline similarity report population in Section 23 (after ≥1k run).
+
+### 22.8 Longer-Term Enhancements
+(unchanged – retained for continuity)
+
+### 22.9 Acceptance Criteria (Baseline)
+Remains valid; criteria (A) now achieved (100% encoder key match). Progress toward (B) pending larger batch job.
+
+### 22.10 Work Queue (Concrete Tasks – Status Updated)
+- [x] Unwrap checkpoint & reload (update loader).
+- [x] Add encoder-only forward path (bypass VAE/decoder).
+- [x] Implement verbose parse error logging.
+- [x] Collect coordinate & command length stats in run_embed (initial batch-level stats).
+- [x] Save embeddings + metadata with width_em/height_em (area derivable).
+- [x] Add similarity_eval script (cosine top-k metrics).
+- [x] Auto-config heuristic for VAE vs bottleneck & hierarchical detection.
+- [ ] Larger evaluation run (≥500 glyphs) + baseline similarity metrics.
+- [ ] Implement memmap persistence.
+- [ ] Document baseline evaluation results (populate Section 23 metrics table).
+- [ ] Decide if global scale needed (post distribution review).
+- [ ] Draft plan for authentic arg tokenization parity (Phase 2).
+- [ ] Dual normalization A/B exploratory run (optional).
+
+### 22.11 Heuristic Loader Outcome Summary
+| Checkpoint | Hierarchical Detected | VAE Keys | Bottleneck Keys | use_vae Chosen | Match Ratio |
+|------------|-----------------------|----------|-----------------|----------------|-------------|
+| hierarchical_ordered.pth.tar | Yes | No | Yes | False | 100.00% (247/247) |
+
+#### 22.11.1 Dynamic Group Bucketing Summary (New)
+| Metric | Observation (256 sample) |
+|--------|---------------------------|
+| Distinct G_used buckets | {1,2,3,4,5,6,7,8} (skewed toward 1–3) |
+| Max G_used in sample | 8 |
+| Mean G_used | ~2.6 (approx; precise stat to log in larger run) |
+| Empty-first columns (pre-fix) | ~31–69% (earlier small runs) |
+| Empty-first columns (post-fix) | 0% |
+| NaN occurrences | 0 after bucketing |
+| Zero-norm embeddings | 0 after bucketing & L2 |
+| Row norm (mean) | ~18.6–19.1 across buckets |
+| Attention stability | Confirmed (no all-masked rows) |
+
+Rationale: Bucketing by actual group count eliminates fully masked attention columns without injecting synthetic tokens, preserving encoder behavior while preventing NaNs.
+
+
+Notes:
+- Previous mismatch (98.39%) eliminated by switching off VAE to align with bottleneck-only weights.
+- Deterministic embeddings: VAE sampling skipped entirely; stable runs ensured.
+
+## 23. Similarity Evaluation & Tooling (Initial / Updated with NaN Findings)
+NOTE: Post Section 24 implementation we will regenerate embeddings with the hierarchical (encode_stages=2) faithful pipeline and re-run similarity evaluation using cluster size filters (e.g. --min-cluster ≥3) to obtain more meaningful top-k metrics and intra/inter separation.
+A new script `src/scripts/similarity_eval.py` was added.
+ 
+Capabilities:
+- Loads embeddings (.pt) + metadata (JSONL).
+- Optional label regex & minimum cluster size filtering.
+- Computes:
+  - Top-k (k configurable) accuracy & MRR (first correct label rank).
+  - Intra-label vs inter-label cosine separation (sampled).
+  - Per-dimension mean/std and row L2 norm stats.
+  - Label cluster size distribution (mean / median / p90 / max).
+- Chunked top-k computation for memory control (O(N * chunk_size * D)).
+ 
+Recent Findings (1K embedding run – pre Phase B fix):
+- 1000 glyph extraction produced (1000, 256) tensor but 985 rows contained NaNs (diagnosed post-run).
+- similarity_eval consumed only 760 rows (cluster filter) and all aggregate stats became NaN (embedding mean/std, intra/inter cosines).
+- Top-5 accuracy ≈ 1.18% (near random), confirming embeddings were numerically invalid rather than semantically weak.
+- Root cause traced to encoder pooling division by zero (padding / visibility masks treating EOS-filled groups as empty → denominator 0 → NaNs).
+- Confirmed hierarchical checkpoint integrator was fine; issue is builder + masking semantics (see Section 22.12).
+ 
+Planned Usage Milestones (Revised):
+1. Re-run a clean 128 glyph sample after masking fix (Phase B) – verify zero NaNs, report token stats.
+2. Run ≥1000 glyphs with hierarchical_ordered (bottleneck; use_vae=False) and recompute:
+   - k=5 and k=10 top-k accuracy
+   - MRR
+   - Intra vs inter mean cosine + separation Δ
+3. Establish baseline acceptance thresholds (post-fix) and lock “Baseline v1”.
+ 
+Upcoming Additions (if needed):
+- Persist neighbor indices for offline inspection.
+- Optional per-label confusion summary.
+- Size-aware re-ranking experiment (penalize large size mismatch).
+- Finite-only embedding filter in similarity_eval (drop rows with embedding_valid == false once metadata flag added).
+ 
+Immediate Next Similarity Actions (Post Phase B):
+- Implement builder refactor + pooling safety (see 22.12).
+- Regenerate 1K embeddings (clean).
+- Produce new sim_metrics_1k_clean.json (k=5,10).
+- Append metrics excerpt below (in 23.1).
+ 
+### 23.1 Baseline Metrics (Hierarchical Faithful Default – Post NaN Fix & Initial Projection Attempt)
+
+Run: hier_auto3000 (limit=3000; hierarchical faithful auto-promoted; min-cluster=3; k=10)  
+Sources: artifacts/hier_auto3000_embeds.pt + artifacts/reports/hier_auto3000_similarity_dual_k10.json
+
+Raw / Filter:
+- Raw embeddings: 3000
+- Retained after cluster filter (≥3 per label): 2534
+- Embedding dim: 256
+
+Fine Label Metrics:
+- Top-10 accuracy: 2.45%
+- MRR@10: 0.0081
+- Intra cosine mean: 0.96475 (std 0.03152, p10 0.92388, p90 0.99230)
+- Inter cosine mean: 0.96440 (std 0.03115, p10 0.92051, p90 0.99212)
+- Separation Δ (intra - inter): 0.00035
+- Effect size (Δ / inter_std): 0.0113
+
+Coarse (joining_group) Metrics:
+- Top-10 accuracy: 28.81%
+- MRR@10: 0.0943
+- Intra cosine mean: 0.96414 (std 0.03141)
+- Inter cosine mean: 0.96439 (std 0.03104)
+- Separation Δ: -0.00026 (effect size -0.0083)
+
+Label Cluster Stats:
+- Num labels: 362
+- Avg cluster size: 7.00 (median 6, p90 11, max 18)
+
+Observations:
+- Embedding space still exhibits angular crowding (global cosine ≈0.96–0.97 across pairs).
+- Coarse grouping substantially improves ranking metrics but not separation—dot/diacritic variants collapse together.
+- Indicates need for a contrastive or projection-head refinement phase; pure pretrained encoder features are not sufficiently discriminative at fine label granularity.
+
+### 23.2 Contrastive Fine-Tune / Post-Processing Plan (Updated After Initial & Extended Projection Trials)
+
+Goals:
+1. Increase fine-label discriminability without harming coarse (joining_group) cohesion.
+2. Achieve meaningful separation effect size (target ≥0.4) after projection.
+
+Tracks:
+A. Post-Processing Head (No model weight updates initially):
+   - Fit PCA (optionally remove top PCs) + scalar feature augmentation (group_count, tokens_non_eos, width_em, height_em).
+   - Learn a small 2-layer MLP projection (e.g. 256(+4 feats)→512→128) with supervised contrastive on (fine and/or coarse).
+   - Compare label-only vs hybrid (label + joining_group positives) vs coarse-only warmup.
+   - Adjust hybrid weighting (alpha) to emphasize fine label discrimination.
+
+B. Light Contrastive Fine-Tune (Unfreeze Upper Layers):
+   - Unfreeze last transformer block (stage2) + bottleneck.
+   - Loss: InfoNCE with temperature τ, positives = same label (Latin/digits/punct) OR same joining_group (Arabic script), negatives sampled across batch.
+   - Hard negative mining: within same joining_group but different fine label to encourage diacritic sensitivity (optional second phase).
+
+C. Evaluation Loop:
+   - Track: top-k accuracy, MRR, intra/inter separation, effect size (fine & coarse), and diacritic gap (planned future metric).
+   - Early stopping on validation separation improvement plateau.
+
+Milestones:
+1. Implement projection module + training script (Phase 1.5).
+2. Generate baseline (done: 23.1).
+3. Run projection-only contrastive (frozen base) – report gains.
+4. If insufficient (<0.25 effect size), proceed to partial unfreeze.
+5. Integrate diacritic sensitivity metric inside joining_group clusters.
+6. Lock “Baseline v2” embedding spec (documented transformation pipeline).
+
+Risks & Mitigations:
+- Overfitting small clusters → Use label frequency floor, temperature regularization.
+- Collapse after whitening → Monitor variance retention of top principal components pre/post projection.
+- Script imbalance → Weighted sampling across scripts (Arabic vs Latin vs others).
+
+Next Actions (Queued - Updated):
+- Hybrid alpha weighting (DONE: alpha=0.7 run) → further sweep (0.6–0.95).
+- Extend training horizons (next: 500 epoch curriculum) with more gradient steps (batch 256).
+- Multi-PC removal beyond 3 (test remove-top={1,3,5,8}).
+- Log explained variance (top 10 PCs) pre/post removal & after 500 epochs.
+- Temperature scheduling (high→low) to promote early spread then sharpening.
+- Hard negative mining (within same joining_group but diff fine label) after initial curriculum separation ≥0.02.
+- Diacritic sensitivity metric integration threshold lowered to effect size ≥0.05 (was 0.1) to allow earlier feedback.
+- Cluster-size reweighting (inverse log or sqrt) to prevent large coarse groups dominating loss.
+- Persist transformation config (PCA params + alpha + temp schedule + removal settings).
+
+
+ 
+### 23.4 Projection Attempts Findings (3-Epoch & 100-Epoch)
+Runs:
+1) 3-Epoch (batch=512, hybrid alpha=0.5, remove-top=1):
+   - Fine Top-10 acc: 2.53% (raw 2.45%)
+   - Fine effect size: 0.0033
+   - Coarse Top-10 acc: 29.08% (raw 28.81%)
+   - Coarse effect size: 0.0144
+
+2) 100-Epoch (batch=256, hybrid alpha=0.7, remove-top=3):
+   - Fine Top-10 acc: 2.49% (unchanged)
+   - Fine separation Δ: 0.00347 (effect size 0.0175) ↑ but still << target
+   - Coarse Top-10 acc: 28.97% (stable)
+   - Coarse effect size: 0.01895 (slight ↑)
+
+Observations:
+- Longer training + alpha weighting increased separation marginally (fine effect size 0.0033 → 0.0175) but remains far below the ≥0.1 interim goal.
+- Loss decreased steadily (4.79 → 3.16) indicating optimization progress without meaningful geometrical discrimination.
+- Multi-PC removal (1→3) helped expand variance (cosine distribution widened) but not label separation.
+- Persistent angular crowding indicates projection-only adaptation is insufficient without curriculum + harder negative pressure.
+
+Revised Near-Term Strategy:
+- Introduce curriculum (coarse-only warmup → fine-heavy → hybrid with hard negatives).
+- Temperature schedule to encourage early broad dispersion (e.g. start 0.18 → end 0.05).
+- Increase PC removal experiments (remove-top=5,8).
+- Add cluster-size reweighting and label frequency balancing.
+- Integrate a diacritic-sensitive feature (tiny subpath count).
+- If after curriculum (≤200 epochs) fine effect size <0.05, plan partial encoder unfreeze.
+
+Updated Success Criteria:
+- Short-term milestone (post-curriculum 200 epochs): fine effect size ≥0.05.
+- Mid-term (500 epochs or partial unfreeze): fine effect size ≥0.15; coarse accuracy within ±2% of baseline.
+- Stretch: fine effect size ≥0.30 with diacritic gap >0.02 (difference between same fine vs diff fine / same joining_group).
+
+Next Step (Executing):
+- Prepare 500-epoch script variants with curriculum and logging.
+ 
+### 22.12 Masking, NaNs & Phase B Remediation Plan (New)
+**Summary of Failure Mode**
+- After extracting 1000 embeddings (hierarchical_ordered checkpoint, use_vae=False), diagnostic pass revealed 985/1000 rows contained NaNs (and effectively zero-norm before guard).
+- NaNs originated from encoder pooling: `(memory * mask).sum / mask.sum` where `mask.sum == 0` for glyphs whose packed command sequence began with EOS tokens (i.e., empty effective token span).
+- Our simplified builder pre-filled all (G,S) slots with EOS and only overwrote a subset for real subpaths; many groups (and sometimes the first flattened token) were EOS → zero valid token count.
+ 
+**Key DeepSVG Mask Semantics (from utils.py)**
+- PAD and EOS share the same token index (EOS acts as both sequence terminator and pad filler).
+- `_get_padding_mask`: marks tokens before first EOS as valid (cumulative EOS count == 0).
+- All-EOS groups (or a glyph whose first token is EOS) yield zero valid tokens → denominator 0 in pooling.
+- Hierarchical visibility merges per-group EOS pattern; second-stage pooling can also produce zero denominators if all groups collapse.
+ 
+**Immediate Fixes Applied**
+- Added denominator clamp (`clamp_min(1e-6)`) in both encoder pooling stages to prevent NaNs (safety net).
+- Added NaN guard in wrapper (`encoder_loader.py`) that replaces NaNs with zeros then renormalizes (temporary mitigation, not a semantic fix).
+ 
+**Phase B (In Progress) – Structural Remediation**
+1. Refactor `SVGTensorBuilder`:
+   - Compact real subpaths contiguously from group 0; trailing groups remain EOS.
+   - Ensure at least one non-EOS command at position 0 (inject synthetic move if necessary).
+   - Track `real_token_count` per glyph; skip glyphs with zero after parsing + filtering.
+2. Add batch stats:
+   - real_token_count min / mean / max
+   - percent skipped (parse + empty) 
+   - count of glyphs falling below a configurable minimum token threshold (e.g. 2).
+3. Remove dependence on NaN guard (it stays enabled but should not trigger post-fix).
+4. Re-run 128 glyph smoke test (hierarchical_ordered; use_vae=False) → expect 0 NaNs.
+5. Re-run 1000 glyph batch → regenerate similarity metrics (Section 23.1).
+ 
+**Deferred (Optional) Enhancements**
+- Introduce SOS/EOS framing per group if empirical results show instability.
+- Synthetic centroid move command for empty glyphs instead of skipping (if skip rate > target).
+- Authentic argument tokenization parity (relative vs absolute) to reduce OOD risk.
+ 
+**Fonts Checkpoint Decision**
+- `hierarchical_ordered_fonts.pth.tar` uses 62 label embeddings (A–Z, a–z, digits); our label set = 1216.
+- For now we exclude that checkpoint to avoid label conditioning mismatch.
+- Future path: expand label embedding matrix & reinitialize; not prioritized until baseline encoder embeddings stabilize.
+ 
+**Acceptance to Conclude Phase B**
+- Zero (or negligible <0.5%) NaN rows without relying on post-hoc guard.
+- real_token_count > 0 for ≥99% of processed glyphs (excluding deliberate skips).
+- Similarity metrics no longer NaN; top‑5 accuracy measurably above random baseline.
+ 
+---
   
 
   These defaults are now fixed for all future embedding runs unless explicitly changed (recording here for reproducibility).
@@ -639,6 +959,95 @@ When reading fonts:
 - [ ] Evaluate effect on cosine similarity (compare both modes on subset).
 
 ## 20. Updated Overall TODO (New Items)
+
+## 24. Hierarchical Faithful Embedding Pipeline Plan (New)
+
+Objectives
+- Eliminate ad-hoc one-stage & improvised builders.
+- Reproduce DeepSVG’s original hierarchical (two-stage) encoder input format (groups × sequence) with authentic command / argument layout, padding, masking, and (optional) relative arguments.
+- Achieve stable, NaN-free embeddings with meaningful intra vs inter label separation.
+
+24.1 Scope
+- Use checkpoint: hierarchical_ordered.pth.tar (bottleneck, no label conditioning, encode_stages=2).
+- Implement canonical per-subpath SVGTensor generation (m, l, c, z; arcs deferred).
+- Integrate grouping, packing, and encoder invocation mirroring repository utilities (no full-model fallback).
+- Support (future toggle) relative argument encoding if `cfg.rel_targets` is ever True.
+
+24.2 Components to Implement
+1. svgtensor_builder (faithful)
+   - Contours → list[SVGTensor] (one per subpath).
+   - Ensure first command is ‘m’; synthesize if absent.
+   - Append ‘z’ if ensure_close and not present.
+   - Truncate before exceeding max_seq_len - 1 (reserve EOS), then .add_eos().pad().
+2. packer
+   - Pack up to max_num_groups → grouped (G,S) tensors (commands, args) with EOS / PAD.
+   - Skip empty subpaths (no group rows with zero valid tokens).
+3. encoder_wrapper refactor
+   - Remove generic forward fallback (no TypeError path).
+   - Always call model.encoder(seq_first_cmds, seq_first_args, label=None).
+   - Apply bottleneck (hierarchical_ordered uses bottleneck; ensure use_vae=False).
+   - Validate returned z shape: expect pooled latent per glyph after second stage.
+4. dataset / batch iterator
+   - Stream glyph rows, build grouped tensors, collate to (N,G,S) → permute to (S,G,N).
+   - Early skip glyphs producing zero tokens.
+5. normalization integration
+   - Reuse norm_v2 pipeline (center + EM scale + uniform scale) exactly as already established.
+6. evaluation adjustments
+   - For similarity: enforce min_cluster >= 3 (or configurable) to avoid near-random top-k due to 2-member clusters.
+   - Record baseline metrics: top-5/top-10 accuracy, MRR, intra/inter cos, separation.
+
+24.3 Algorithmic Fidelity Checks
+- Command indices must be in [0, n_commands-1]; EOS exclusively for padding/tail.
+- Args: raw indices in valid bin range; PAD_VAL=-1; rely on embedding layer’s (args+1) shift.
+- No negative indices < -1; no values ≥ args_dim.
+- Mask sanity:
+  - padding_mask.sum() per sample > 0.
+  - No sample returns denominator 0 in pooling.
+
+24.4 Validation Steps
+1. Smoke Test (N=32)
+   - Confirm: no NaNs; pre-L2 norm distribution (report min/mean/max).
+   - Log token utilization (% of (G*S)).
+2. Mid Test (N=512)
+   - Confirm stable norms; capture cluster distribution.
+3. Similarity Eval (N≥1000)
+   - Compute: top-5, top-10 accuracy, MRR, intra/inter cosine, separation.
+   - Target improvement: separation > 0.05 (initial goal) vs current ~0.015.
+4. Regression Guard
+   - Add assertion: if any encoder output row norm < 1e-9 or NaN → raise & log failing glyph id.
+
+24.5 Risks & Mitigations
+| Risk | Impact | Mitigation |
+|------|--------|------------|
+| Positional encoding mismatch | NaNs / wrong shapes | Load exact hierarchical config before state dict; never force one-stage for hierarchical ckpt. |
+| Truncation of long subpaths | Lost detail | Log truncated token counts; future dynamic splitting if needed. |
+| Small label clusters | Depressed top-k accuracy | Filter by min_cluster or upsample fonts per label for eval. |
+| Ignoring arcs | Slight distribution shift | Keep 'a' slot reserved; optionally implement arc handling later. |
+| Relative args absence (if config toggled) | Lower geometric invariance | Gate relative encoding behind config flag and add later if required. |
+
+24.6 Implementation Order (Actionable)
+1. Add faithful svgtensor builder module.
+2. Add packer and batch collation for (N,G,S).
+3. Refactor encoder wrapper (remove fallback, enforce encode-only path, disable VAE).
+4. Integrate into run_embed via new flag --faithful-hier (default ON once stable).
+5. Smoke test (N=32) log: token utilization, norms.
+6. Scale test (N=512) collect metrics.
+7. Full run (N≥1000) + similarity_eval (min_cluster=3).
+8. Update progress.md with baseline metrics table.
+9. Remove interim one-stage & legacy simplified builder from default path (leave behind flag).
+
+24.7 Success Criteria (Baseline)
+- 0 NaN embeddings across >1000 glyphs.
+- Intra − Inter cosine separation ≥ 0.05 (stretch goal ≥ 0.08).
+- Top-5 accuracy > random baseline (measure baseline random ~ 1/(avg cluster size -1)).
+- Stable encode throughput (≤ 2s per 512 glyphs CPU baseline acceptable).
+
+24.8 Post-Baseline Enhancements (Deferred)
+- Implement arcs (‘a’): parameter extraction, quantization, mask.
+- Relative argument encoding path.
+- Contrastive fine-tuning head; downstream retrieval improvement.
+- Projection head + metric learning (triplet / InfoNCE).
+- Batch-level caching (reuse parsed SVGTensors).
 - [ ] Analyze `qCurveTo` payload variants (sample 500).
 - [ ] Implement quadratic → cubic conversion utility.
 - [ ] Add conversion flag for debugging (`--no-qcubic`).

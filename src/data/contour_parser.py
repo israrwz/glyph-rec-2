@@ -79,6 +79,9 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 
+from dataclasses import dataclass
+
+
 @dataclass(frozen=True)
 class ContourCommand:
     """
