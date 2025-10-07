@@ -569,10 +569,12 @@ class GlyphRasterDataset(Dataset):
                 else:
                     # Memmap path
                     raw = self._preraster_memmap[pr_idx]  # numpy array
-                    if raw.dtype == np.uint8:
-                        img = torch.from_numpy(raw).to(torch.float32) / 255.0
+                    # Use a writable copy to avoid non-writable memmap warning and undefined behavior.
+                    raw_local = raw.copy()
+                    if raw_local.dtype == np.uint8:
+                        img = torch.from_numpy(raw_local).to(torch.float32) / 255.0
                     else:
-                        img = torch.from_numpy(raw).to(torch.float32)
+                        img = torch.from_numpy(raw_local).to(torch.float32)
                 if self.cfg.augment:
                     local_rng = random.Random(self.cfg.seed + row.glyph_id)
                     img = _augment_tensor(

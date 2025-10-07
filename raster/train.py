@@ -554,12 +554,13 @@ def train_one_epoch(
             return ce(logits, labels)
         # Cosine logits (dimensions now aligned)
         cos = torch.matmul(feat_norm, W_norm.t()).clamp(-1.0, 1.0)  # (B,C)
-        # Add margin to target classes
+        # Angular margin application (no in-place ops to preserve autograd history)
         theta = torch.acos(cos.clamp(-1 + 1e-7, 1 - 1e-7))
         target_theta = theta[torch.arange(theta.size(0)), labels] + arcface_margin
         cos_target = torch.cos(target_theta)
-        cos.scatter_(1, labels.view(-1, 1), cos_target.unsqueeze(1))
-        scaled = cos * arcface_scale
+        cos_margin = cos.clone()
+        cos_margin[torch.arange(cos_margin.size(0)), labels] = cos_target
+        scaled = cos_margin * arcface_scale
         return ce(scaled, labels)
 
     for batch in loader:
