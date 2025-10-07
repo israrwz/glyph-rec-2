@@ -545,12 +545,12 @@ def train_one_epoch(
         linear = head.l  # BN_Linear.l (Linear)
         W = linear.weight  # (C, D)
         # Normalize features & weights
-        with torch.no_grad():
-            W_norm = torch.nn.functional.normalize(W, dim=1)
-        feat_norm = torch.nn.functional.normalize(feats.detach(), dim=1)
+        # Normalize weights & features with gradients enabled (ArcFace requires grads through both)
+        W_norm = torch.nn.functional.normalize(W, dim=1)
+        feat_norm = torch.nn.functional.normalize(feats, dim=1)
         if feat_norm.shape[1] != W_norm.shape[1]:
             # Safeguard: feature dim (e.g. 128) mismatches classifier weight dim (e.g. 384)
-            # Fallback to standard CE on original logits.
+            # Fallback to standard CE on original logits (avoid silent failure).
             return ce(logits, labels)
         # Cosine logits (dimensions now aligned)
         cos = torch.matmul(feat_norm, W_norm.t()).clamp(-1.0, 1.0)  # (B,C)
@@ -644,6 +644,48 @@ def main(argv=None) -> int:
     print(
         f"[INFO] Train size={len(train_ds)} | Val size={len(val_ds)} | Num classes={len(train_ds.label_to_index)}"
     )
+    # Memmap integrity quick check: if reused memmap appears entirely blank at a few sampled indices,
+    # rebuild an in-memory tensor fallback (prevents silent all-zero inputs).
+    try:
+        if (
+            hasattr(train_ds, "_preraster_memmap")
+            and train_ds._preraster_memmap is not None
+        ):
+            mm = train_ds._preraster_memmap
+            H = train_ds.cfg.image_size
+            W = train_ds.cfg.image_size
+            sample_indices = [0, len(mm) // 4, len(mm) // 2, (3 * len(mm)) // 4]
+            zero_like = 0
+            for si in sample_indices:
+                if si < len(mm):
+                    if mm[si].sum() == 0:
+                        zero_like += 1
+            if zero_like == len(sample_indices):
+                print(
+                    "[WARN] Detected all sampled preraster memmap blocks are zero; rebuilding in-memory preraster tensor."
+                )
+                import torch as _torch
+
+                rebuilt = []
+                for row in train_ds._rows:
+                    t = train_ds._rasterize(row)
+                    rebuilt.append((t.clamp(0, 1) * 255).to(_torch.uint8))
+                train_ds._preraster_tensor = _torch.stack(rebuilt, dim=0)
+                train_ds._preraster_memmap = None
+                # Mirror to val split if it shares adoption
+                if (
+                    hasattr(val_ds, "_preraster_memmap")
+                    and val_ds._preraster_memmap is not None
+                ):
+                    val_rebuilt = []
+                    for row in val_ds._rows:
+                        t = val_ds._rasterize(row)
+                        val_rebuilt.append((t.clamp(0, 1) * 255).to(_torch.uint8))
+                    val_ds._preraster_tensor = _torch.stack(val_rebuilt, dim=0)
+                    val_ds._preraster_memmap = None
+                print("[INFO] In-memory preraster rebuild complete (memmap replaced).")
+    except Exception as _e:
+        print(f"[WARN] Memmap integrity check skipped due to error: {_e}")
 
     # A. Save label mapping
     label_map_path = artifacts_dir / "label_to_index.json"
