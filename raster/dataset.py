@@ -534,25 +534,14 @@ class GlyphRasterDataset(Dataset):
         return t.clone()
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
+        """
+        Optimized fast path:
+        - If a pre-raster tensor or memmap exists, load that FIRST (no redundant rasterization).
+        - Only fall back to on-demand rasterization if cache is absent or glyph not found.
+        """
         row = self._rows[idx]
-        img = self._rasterize(row)
 
-        if self.cfg.augment:
-            # Use a per-sample RNG derived from global seed + glyph_id to keep determinism
-            local_rng = random.Random(self.cfg.seed + row.glyph_id)
-            img = _augment_tensor(
-                img,
-                rng=local_rng,
-                translate_px=self.cfg.translate_px,
-                scale_jitter=self.cfg.scale_jitter,
-                contrast_jitter=self.cfg.contrast_jitter,
-                gamma_jitter=self.cfg.gamma_jitter,
-                blur_prob=self.cfg.blur_prob,
-                blur_kernel=self.cfg.blur_kernel,
-            )
-
-        label_idx = self.label_to_index[row.label]
-        # If pre-rasterized, pull from tensor or memmap (avoids re-render cost)
+        # Fast path: preraster tensor or memmap lookup
         if self._preraster_tensor is not None or self._preraster_memmap is not None:
             if not hasattr(self, "_gid_to_pr_idx"):
                 self._gid_to_pr_idx = {
@@ -561,20 +550,19 @@ class GlyphRasterDataset(Dataset):
             pr_idx = self._gid_to_pr_idx.get(row.glyph_id, None)
             if pr_idx is not None:
                 if self._preraster_tensor is not None:
-                    cached_img = self._preraster_tensor[pr_idx]
-                    if cached_img.dtype == torch.uint8:
-                        img = cached_img.to(torch.float32) / 255.0
+                    cached = self._preraster_tensor[pr_idx]
+                    if cached.dtype == torch.uint8:
+                        img = cached.to(torch.float32) / 255.0
                     else:
-                        img = cached_img
+                        img = cached
                 else:
-                    # Memmap path
-                    raw = self._preraster_memmap[pr_idx]  # numpy array
-                    # Use a writable copy to avoid non-writable memmap warning and undefined behavior.
-                    raw_local = raw.copy()
-                    if raw_local.dtype == np.uint8:
-                        img = torch.from_numpy(raw_local).to(torch.float32) / 255.0
+                    raw = self._preraster_memmap[
+                        pr_idx
+                    ].copy()  # copy to ensure writable ndarray
+                    if raw.dtype == np.uint8:
+                        img = torch.from_numpy(raw).to(torch.float32) / 255.0
                     else:
-                        img = torch.from_numpy(raw_local).to(torch.float32)
+                        img = torch.from_numpy(raw).to(torch.float32)
                 if self.cfg.augment:
                     local_rng = random.Random(self.cfg.seed + row.glyph_id)
                     img = _augment_tensor(
@@ -587,9 +575,32 @@ class GlyphRasterDataset(Dataset):
                         blur_prob=self.cfg.blur_prob,
                         blur_kernel=self.cfg.blur_kernel,
                     )
+                label_idx = self.label_to_index[row.label]
+                return {
+                    "image": img,
+                    "label": label_idx,
+                    "glyph_id": row.glyph_id,
+                    "font_hash": row.font_hash,
+                    "raw_label": row.label,
+                }
 
+        # Slow path: no preraster cache available -> rasterize now
+        img = self._rasterize(row)
+        if self.cfg.augment:
+            local_rng = random.Random(self.cfg.seed + row.glyph_id)
+            img = _augment_tensor(
+                img,
+                rng=local_rng,
+                translate_px=self.cfg.translate_px,
+                scale_jitter=self.cfg.scale_jitter,
+                contrast_jitter=self.cfg.contrast_jitter,
+                gamma_jitter=self.cfg.gamma_jitter,
+                blur_prob=self.cfg.blur_prob,
+                blur_kernel=self.cfg.blur_kernel,
+            )
+        label_idx = self.label_to_index[row.label]
         return {
-            "image": img,  # (1,H,W)
+            "image": img,
             "label": label_idx,
             "glyph_id": row.glyph_id,
             "font_hash": row.font_hash,

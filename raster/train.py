@@ -223,6 +223,12 @@ def parse_args(argv=None):
         action="store_true",
         help="Disable augmentations (useful for deterministic eval or caching).",
     )
+    ap.add_argument(
+        "--log-interval",
+        type=int,
+        default=200,
+        help="Batches between intra-epoch progress prints (0 disables).",
+    )
     return ap.parse_args(argv)
 
 
@@ -512,6 +518,7 @@ def train_one_epoch(
     arcface_margin: float = 0.0,
     arcface_scale: float = 30.0,
     grad_clip: float = 0.0,
+    log_interval: int = 200,  # batches between progress prints (0 disables)
 ) -> Dict[str, Any]:
     model.train()
     total_loss = 0.0
@@ -563,7 +570,7 @@ def train_one_epoch(
         scaled = cos_margin * arcface_scale
         return ce(scaled, labels)
 
-    for batch in loader:
+    for batch_idx, batch in enumerate(loader, start=1):
         imgs = batch["images"].to(device)
         labels = batch["labels"].to(device)
         optimizer.zero_grad()
@@ -583,6 +590,18 @@ def train_one_epoch(
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         last_grad_norm = _global_grad_norm(model)
         optimizer.step()
+        # Intra-epoch progress (prints every log_interval batches, if enabled)
+        if log_interval > 0 and (
+            batch_idx % log_interval == 0 or batch_idx == len(loader)
+        ):
+            try:
+                total_batches = len(loader)
+            except Exception:
+                total_batches = -1
+            print(
+                f"[BATCH] prog={batch_idx}/{total_batches if total_batches > 0 else '?'} "
+                f"loss={loss.item():.4f}"
+            )
         bs = imgs.size(0)
         total_loss += loss.item() * bs
         total_samples += bs
@@ -775,6 +794,7 @@ def main(argv=None) -> int:
             arcface_margin=args.arcface_margin,
             arcface_scale=args.arcface_scale,
             grad_clip=args.grad_clip,
+            log_interval=args.log_interval,
         )
         val_stats = validate(model, val_loader, device)
 
