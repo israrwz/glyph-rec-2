@@ -456,6 +456,79 @@ This plan defines a contained raster embedding subsystem: focused, minimal, and 
 | 10 | ArcFace / margin extension | BACKLOG | Activate only if baseline effect size < target. |
 
 ### Immediate Next Steps
+
+#### Large-Scale Training Progress & Next Actions (Update)
+We have:
+- Implemented heuristic font metric fallback (fixed tiny + shifted glyph sizing).
+- Added bottom-left font hash annotation in visualization.
+- Added label frequency filtering (min_label_count / drop_singletons).
+- Implemented pre-rasterization (in-memory + memmap) with reuse + parallel thread workers.
+- Added full resume (model + optimizer state), epoch offset display.
+- Added retrieval debug metrics (effect, diff, gap).
+- Implemented ArcFace-style angular margin (optional).
+- Added warning suppression, gradient clipping, configurable retrieval cadence.
+- Implemented memmap reuse + clone/adopt datasets to avoid duplicate pre-raster builds.
+
+Readiness for full 528k run:
+- Memory: uint8 preraster ≈ 8.7 GB fits easily in 384 GB RAM (E48ds_v4).
+- Parallelism: Use modest DataLoader workers (I/O light after pre-raster). Most CPU goes to model matmuls (set OMP/MKL threads).
+- Retrieval: Cap to 8k samples to avoid excessive NxN similarity cost.
+- Resume: Safe to recover from interruptions (best + optimizer state).
+- ArcFace: Optional; start with margin=0.15; disable if early instability.
+
+Recommended environment (shell):
+export OMP_NUM_THREADS=32
+export MKL_NUM_THREADS=32
+export PYTHONWARNINGS=ignore
+
+Full 528k command (baseline + margin):
+python -m raster.train \
+  --db dataset/glyphs.db \
+  --limit 528000 \
+  --epochs 45 \
+  --batch-size 256 \
+  --val-frac 0.1 \
+  --num-workers 4 \
+  --pre-rasterize \
+  --pre-raster-mmap \
+  --pre-raster-workers 16 \
+  --pre-raster-mmap-path preraster_full_528k_u8.dat \
+  --min-label-count 2 \
+  --drop-singletons \
+  --warmup-frac 0.05 \
+  --retrieval-cap 8000 \
+  --retrieval-every 5 \
+  --grad-clip 1.0 \
+  --arcface-margin 0.15 \
+  --arcface-scale 32 \
+  --save-every 5 \
+  --suppress-warnings
+
+If you want a “no-margin” baseline first (recommended to quantify uplift), run the same command with:
+  --arcface-margin 0.0
+
+Early epoch monitoring checklist (first 5 epochs):
+- train_loss: steady decrease (no spikes after warmup).
+- val_loss: slight wobble then downward trend.
+- val_acc: rising above (1 / num_classes) * 10 within first 8–10 epochs.
+- effect_size: should become >0.25 by mid-run; if flat + val_acc rising, consider increasing margin later.
+- grad_norm: stable (not exploding; ~3–8 typical early, then taper).
+
+Next possible enhancements (post 528k baseline):
+1. ANN retrieval (FAISS) for larger validation sampling.
+2. Hard negative mining (adaptive retrieval pairs for margin head).
+3. Dual-resolution (128 + 64) stacked channels.
+4. True open-set rejection threshold calibration (distribution modeling on inter-class cosine).
+5. Persist preraster metadata signature file (skip accidental rebuild).
+6. Batch-level adaptive LR or cosine restart if plateau.
+
+Success criteria for large-scale run:
+- Font-disjoint val_acc > baseline small-run ratio scaled (target: >0.22 if 16–17% at 16k).
+- Effect size ≥ 0.45 without margin, ≥ 0.52 with margin (targets).
+- Stable training (no divergence, no NaNs) through epoch 45.
+- Retrieval diff (mu_intra - mu_inter) trend plateauing late but not decreasing.
+
+(Existing task list below retained.)
 NOTE: For ephemeral Python diagnostics or quick inspections, invoke inline scripts as:
 python -c '...entire script here...'
 Ensure the whole code (including newlines if any) is inside a single pair of single quotes and avoid using unescaped single quotes inside the body. This is required for the current shell environment and replaces prior here-doc style attempts.

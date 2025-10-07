@@ -104,6 +104,8 @@ class DatasetConfig:
         False  # If True, pre-render all glyphs (unaugmented) into a tensor
     )
     pre_raster_dtype: str = "uint8"  # "uint8" or "float32" storage for pre-raster
+    # Parallel pre-raster workers (threaded) – 0 = sequential
+    pre_raster_workers: int = 0
     # Memory-mapped pre-raster (optional: backed by np.memmap on disk)
     pre_raster_mmap: bool = False
     pre_raster_mmap_path: Optional[str] = (
@@ -294,6 +296,38 @@ class GlyphRasterDataset(Dataset):
         self.index_to_label: List[str] = labels
         # Glyph ordering for resume / reproducibility
         self.glyph_id_order: List[int] = [r.glyph_id for r in self._rows]
+        # If adopting existing rows (clone path), skip pre-raster & early exit
+        if getattr(self.cfg, "_adopt_rows", False):
+            # Cloned dataset shares pre-raster buffers & vocab; ensure placeholders present
+            self._preraster_tensor = getattr(self.cfg, "_parent_preraster_tensor", None)
+            self._preraster_memmap = getattr(self.cfg, "_parent_preraster_memmap", None)
+            self.rasterizer = rasterizer or Rasterizer(
+                RasterizerConfig(
+                    size=config.image_size,
+                    supersample=config.supersample,
+                    cubic_subdiv=config.cubic_subdiv,
+                    stroke_px=config.stroke_px,
+                    fill_closed=config.fill_closed,
+                    fit_mode=config.fit_mode,
+                    hole_strategy=config.hole_strategy,
+                    clip_out_of_bounds=config.clip_out_of_bounds,
+                )
+            )
+            return
+
+        # Initialize rasterizer BEFORE optional pre-rasterization so _rasterize() works
+        r_cfg = RasterizerConfig(
+            size=config.image_size,
+            supersample=config.supersample,
+            cubic_subdiv=config.cubic_subdiv,
+            stroke_px=config.stroke_px,
+            fill_closed=config.fill_closed,
+            fit_mode=config.fit_mode,
+            hole_strategy=config.hole_strategy,
+            clip_out_of_bounds=config.clip_out_of_bounds,
+        )
+        self.rasterizer = rasterizer or Rasterizer(r_cfg)
+
         # Optional pre-rasterization (unaugmented)
         self._preraster_tensor: Optional[torch.Tensor] = None
         self._preraster_memmap: Optional[np.memmap] = None
@@ -303,6 +337,53 @@ class GlyphRasterDataset(Dataset):
             W = self.cfg.image_size
             use_uint8 = self.cfg.pre_raster_dtype == "uint8"
             if self.cfg.pre_raster_mmap:
+                # Reuse existing memmap if path exists and shape/dtype match
+                mmap_path = self.cfg.pre_raster_mmap_path
+                total = len(self._rows)
+                H = self.cfg.image_size
+                W = self.cfg.image_size
+                use_uint8 = self.cfg.pre_raster_dtype == "uint8"
+                dtype_np = np.uint8 if use_uint8 else np.float32
+                expected_shape = (total, 1, H, W)
+                can_reuse = False
+                if mmap_path is None:
+                    mmap_path = (
+                        f"preraster_{total}_{H}x{W}_{'u8' if use_uint8 else 'f32'}.dat"
+                    )
+                else:
+                    # If user supplied path and it exists, probe it
+                    if os.path.isfile(mmap_path):
+                        try:
+                            existing = np.memmap(
+                                mmap_path,
+                                mode="r",
+                                dtype=dtype_np,
+                                shape=expected_shape,
+                            )
+                            # Simple content sanity: check a few bytes not all zero
+                            sample_bytes = existing[0, 0, :2, :2].sum()
+                            can_reuse = True
+                            if self.cfg.verbose_stats:
+                                print(
+                                    f"[DATASET] Reusing existing preraster memmap '{mmap_path}' sample_sum={float(sample_bytes):.1f}"
+                                )
+                            self._preraster_memmap = existing
+                            # Initialize rasterizer (later in normal path) then return early
+                            r_cfg = RasterizerConfig(
+                                size=self.cfg.image_size,
+                                supersample=self.cfg.supersample,
+                                cubic_subdiv=self.cfg.cubic_subdiv,
+                                stroke_px=self.cfg.stroke_px,
+                                fill_closed=self.cfg.fill_closed,
+                                fit_mode=self.cfg.fit_mode,
+                                hole_strategy=self.cfg.hole_strategy,
+                                clip_out_of_bounds=self.cfg.clip_out_of_bounds,
+                            )
+                            self.rasterizer = rasterizer or Rasterizer(r_cfg)
+                            return
+                        except Exception:
+                            can_reuse = False
+                self.cfg.pre_raster_mmap_path = mmap_path
                 # Set up memory-mapped file
                 mmap_path = self.cfg.pre_raster_mmap_path
                 if mmap_path is None:
@@ -324,16 +405,47 @@ class GlyphRasterDataset(Dataset):
                         f"[DATASET] Pre-rasterizing {total} glyphs (in-memory dtype={self.cfg.pre_raster_dtype})..."
                     )
             imgs = [] if not self.cfg.pre_raster_mmap else None
-            for i, r in enumerate(self._rows):
-                t = self._rasterize(r)
-                if use_uint8:
-                    arr = (t.clamp(0, 1) * 255).to(torch.uint8)
-                else:
-                    arr = t.to(torch.float32)
-                if mm is not None:
-                    mm[i] = arr.cpu().numpy()
-                else:
-                    imgs.append(arr)
+            # Parallel (thread) pre-rasterization if requested
+            if self.cfg.pre_raster_workers and self.cfg.pre_raster_workers > 0:
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+
+                def _render(row):
+                    t_local = self._rasterize(row)
+                    if use_uint8:
+                        return (t_local.clamp(0, 1) * 255).to(torch.uint8)
+                    return t_local.to(torch.float32)
+
+                with ThreadPoolExecutor(max_workers=self.cfg.pre_raster_workers) as ex:
+                    futures = {
+                        ex.submit(_render, r): i for i, r in enumerate(self._rows)
+                    }
+                    for fut in as_completed(futures):
+                        i = futures[fut]
+                        try:
+                            arr = fut.result()
+                        except Exception:
+                            # Fallback blank tensor on failure
+                            arr = torch.zeros(
+                                1,
+                                H,
+                                W,
+                                dtype=torch.uint8 if use_uint8 else torch.float32,
+                            )
+                        if mm is not None:
+                            mm[i] = arr.cpu().numpy()
+                        else:
+                            imgs.append(arr)
+            else:
+                for i, r in enumerate(self._rows):
+                    t = self._rasterize(r)
+                    if use_uint8:
+                        arr = (t.clamp(0, 1) * 255).to(torch.uint8)
+                    else:
+                        arr = t.to(torch.float32)
+                    if mm is not None:
+                        mm[i] = arr.cpu().numpy()
+                    else:
+                        imgs.append(arr)
             if mm is not None:
                 mm.flush()
                 self._preraster_memmap = mm
@@ -355,18 +467,8 @@ class GlyphRasterDataset(Dataset):
                         f"[DATASET] Pre-raster tensor built: shape={tuple(self._preraster_tensor.shape)} ~{mb:.1f} MB"
                     )
 
-        # Prepare rasterizer
-        r_cfg = RasterizerConfig(
-            size=config.image_size,
-            supersample=config.supersample,
-            cubic_subdiv=config.cubic_subdiv,
-            stroke_px=config.stroke_px,
-            fill_closed=config.fill_closed,
-            fit_mode=config.fit_mode,
-            hole_strategy=config.hole_strategy,
-            clip_out_of_bounds=config.clip_out_of_bounds,
-        )
-        self.rasterizer = rasterizer or Rasterizer(r_cfg)
+        # Rasterizer already initialized earlier (before pre-rasterization).
+        # (No action needed here now.)
 
         # Optional LRU cache (already initialized earlier; keep for clarity / future re-init)
         # (No change needed here; attributes exist to avoid AttributeError during pre-raster phase)
@@ -511,30 +613,58 @@ def make_train_val_split(
     val_rows = [dataset._rows[i] for i in indices[:val_size]]
 
     def _clone_with_rows(rows: List[GlyphRow]) -> GlyphRasterDataset:
+        # Build a lightweight cfg clone that signals row adoption
         cfg = dataset.cfg
-        clone = GlyphRasterDataset(cfg, rasterizer=dataset.rasterizer)
-        # Override rows and reuse vocab & cache/pre-raster settings
+        adopt_cfg = DatasetConfig(
+            db_path=cfg.db_path,
+            limit=len(rows),
+            randomize_query=False,
+            image_size=cfg.image_size,
+            supersample=cfg.supersample,
+            cubic_subdiv=cfg.cubic_subdiv,
+            stroke_px=cfg.stroke_px,
+            fill_closed=cfg.fill_closed,
+            fit_mode=cfg.fit_mode,
+            hole_strategy=cfg.hole_strategy,
+            clip_out_of_bounds=cfg.clip_out_of_bounds,
+            augment=cfg.augment,
+            translate_px=cfg.translate_px,
+            scale_jitter=cfg.scale_jitter,
+            contrast_jitter=cfg.contrast_jitter,
+            gamma_jitter=cfg.gamma_jitter,
+            blur_prob=cfg.blur_prob,
+            blur_kernel=cfg.blur_kernel,
+            cache_size=cfg.cache_size,
+            pre_rasterize=False,  # prevent rebuild
+            pre_raster_dtype=cfg.pre_raster_dtype,
+            pre_raster_mmap=cfg.pre_raster_mmap,
+            pre_raster_mmap_path=cfg.pre_raster_mmap_path,
+            min_label_count=cfg.min_label_count,
+            drop_singletons=False,  # already filtered
+            verbose_stats=False,
+            enable_margin_targets=cfg.enable_margin_targets,
+            seed=cfg.seed,
+            label_filter=None,
+        )
+        # Internal adoption markers
+        setattr(adopt_cfg, "_adopt_rows", True)
+        setattr(
+            adopt_cfg,
+            "_parent_preraster_tensor",
+            getattr(dataset, "_preraster_tensor", None),
+        )
+        setattr(
+            adopt_cfg,
+            "_parent_preraster_memmap",
+            getattr(dataset, "_preraster_memmap", None),
+        )
+        clone = GlyphRasterDataset(adopt_cfg, rasterizer=dataset.rasterizer)
         clone._rows = rows
         clone.label_to_index = dataset.label_to_index
         clone.index_to_label = dataset.index_to_label
         clone.glyph_id_order = [r.glyph_id for r in rows]
-        if (
-            hasattr(dataset, "_preraster_tensor")
-            and dataset._preraster_tensor is not None
-        ):
-            # Slice pre-raster tensor to new ordering if possible
-            gid_to_idx = {gid: i for i, gid in enumerate(dataset.glyph_id_order)}
-            sel = []
-            ok = True
-            for r in rows:
-                idx = gid_to_idx.get(r.glyph_id, None)
-                if idx is None:
-                    ok = False
-                    break
-                sel.append(idx)
-            if ok:
-                clone._preraster_tensor = dataset._preraster_tensor[sel]
-        # Clear standard LRU caches (lazy repopulation)
+        # Share preraster buffers directly (already assigned in constructor via adoption flags)
+        # Reset per-clone caches
         clone._cache.clear()
         clone._cache_order.clear()
         return clone

@@ -35,6 +35,11 @@ Author: Raster Phase 1
 
 from __future__ import annotations
 
+import warnings
+
+warnings.filterwarnings("ignore", message=".*_register_pytree_node.*")
+warnings.filterwarnings("ignore", message=".*timm.models.registry.*")
+
 import argparse
 import json
 import math
@@ -107,6 +112,8 @@ def parse_args(argv=None):
         help="Run retrieval metrics every N epochs (default: every epoch).",
     )
     ap.add_argument("--seed", type=int, default=42, help="Global RNG seed")
+    # NOTE: --pre-raster-workers defined later (single canonical definition)
+    # (Removed duplicate --suppress-warnings definition; single canonical definition kept later)
     ap.add_argument(
         "--resume",
         type=str,
@@ -130,6 +137,17 @@ def parse_args(argv=None):
         type=float,
         default=0.0,
         help="If >0, enable ArcFace-like angular margin loss with given margin (m, radians).",
+    )
+    ap.add_argument(
+        "--pre-raster-workers",
+        type=int,
+        default=0,
+        help="Parallel workers (threads) for pre-raster build phase (0=sequential).",
+    )
+    ap.add_argument(
+        "--suppress-warnings",
+        action="store_true",
+        help="Suppress common deprecation warnings (timm registry, pytree).",
     )
     ap.add_argument(
         "--lr-backbone", type=float, default=1e-3, help="Backbone base learning rate"
@@ -280,6 +298,7 @@ def build_loaders(
         min_label_count=args.min_label_count,
         drop_singletons=args.drop_singletons,
         verbose_stats=True,
+        pre_raster_workers=args.pre_raster_workers,
     )
     full_ds = GlyphRasterDataset(ds_cfg)
     if args.font_disjoint:
@@ -500,20 +519,44 @@ def train_one_epoch(
     ce = nn.CrossEntropyLoss()
     last_grad_norm = 0.0
 
-    def _arcface_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        # ArcFace-like margin: convert logits (cosine) to angles if already normalized?
-        # Here we approximate by assuming logits are raw pre-softmax linear outputs.
-        # To keep scaffolding light, we apply margin to the logit of the true class only.
-        # This is NOT a perfect ArcFace implementation (which expects normalized features & weights).
+    def _arcface_loss(
+        logits: torch.Tensor, labels: torch.Tensor, feats: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        True-ish ArcFace:
+          - Normalize feature vectors and classification weight vectors
+          - Compute cosine
+          - Add angular margin to target classes: cos(theta+m)
+          - Scale by arcface_scale then cross entropy
+        """
         if arcface_margin <= 0:
             return ce(logits, labels)
+
+        # Extract the linear head weight/bias (assumes backbone.head exists)
+        head = getattr(model.backbone, "head", None)
+        if head is None or not hasattr(head, "l"):
+            # Fallback to legacy shift if structure unexpected
+            with torch.no_grad():
+                one_hot = torch.zeros_like(logits)
+                one_hot.scatter_(1, labels.view(-1, 1), 1.0)
+            adjusted = logits - one_hot * arcface_margin * arcface_scale
+            return ce(adjusted / arcface_scale, labels)
+
+        linear = head.l  # BN_Linear.l (Linear)
+        W = linear.weight  # (C, D)
+        # Normalize features & weights
         with torch.no_grad():
-            one_hot = torch.zeros_like(logits)
-            one_hot.scatter_(1, labels.view(-1, 1), 1.0)
-        # Subtract margin (scaled) from target logits before softmax
-        # (ArcFace normally: cos(theta + m) = cosθ*cosm - sinθ*sinm; we approximate a direct shift)
-        adjusted = logits - one_hot * arcface_margin * arcface_scale
-        return ce(adjusted / arcface_scale, labels)
+            W_norm = torch.nn.functional.normalize(W, dim=1)
+        feat_norm = torch.nn.functional.normalize(feats.detach(), dim=1)
+        # Cosine logits
+        cos = torch.matmul(feat_norm, W_norm.t()).clamp(-1.0, 1.0)  # (B,C)
+        # Add margin to target classes
+        theta = torch.acos(cos.clamp(-1 + 1e-7, 1 - 1e-7))
+        target_theta = theta[torch.arange(theta.size(0)), labels] + arcface_margin
+        cos_target = torch.cos(target_theta)
+        cos.scatter_(1, labels.view(-1, 1), cos_target.unsqueeze(1))
+        scaled = cos * arcface_scale
+        return ce(scaled, labels)
 
     for batch in loader:
         imgs = batch["images"].to(device)
@@ -521,8 +564,11 @@ def train_one_epoch(
         optimizer.zero_grad()
         out = model(imgs)
         logits = out["logits"]
+        feats_for_margin = out[
+            "embedding"
+        ]  # normalized already; still normalize again in loss
         if arcface_margin > 0.0:
-            loss = _arcface_loss(logits, labels)
+            loss = _arcface_loss(logits, labels, feats_for_margin)
         else:
             loss = ce(logits, labels)
         loss.backward()
@@ -608,12 +654,22 @@ def main(argv=None) -> int:
     print(f"[INFO] Model params: {n_params / 1e6:.3f}M")
 
     # Resume logic (F): load checkpoint weights & report prior val accuracy if available
+    resume_epoch_offset = 0
     if args.resume:
         if os.path.isfile(args.resume):
             try:
                 ckpt = torch.load(args.resume, map_location="cpu")
                 load_checkpoint(model, args.resume, strict=False)
                 prev_val = ckpt.get("extra", {}).get("val_accuracy", None)
+                opt_state_path = Path(args.resume).parent / "optimizer_state.pt"
+                if opt_state_path.is_file():
+                    try:
+                        opt_state = torch.load(opt_state_path, map_location="cpu")
+                        prev_epoch = opt_state.get("epoch", 0)
+                        resume_epoch_offset = prev_epoch
+                        print(f"[INFO] Loaded optimizer state epoch={prev_epoch}")
+                    except Exception as e:
+                        print(f"[WARN] Could not load optimizer state: {e}")
                 if prev_val is not None:
                     print(
                         f"[INFO] Resumed from {args.resume} (prev best val_acc={prev_val:.4f})"
@@ -656,7 +712,7 @@ def main(argv=None) -> int:
     best_epoch = -1
 
     train_start = time.time()
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(resume_epoch_offset + 1, resume_epoch_offset + args.epochs + 1):
         adjust_lrs(
             optimizer, epoch - 1, args.epochs, base_lrs, warmup_epochs=warmup_epochs
         )
@@ -738,7 +794,8 @@ def main(argv=None) -> int:
             f.write(json.dumps(log_record) + "\n")
 
         summary = (
-            f"[EPOCH {epoch}/{args.epochs}] "
+            f"[EPOCH {epoch - resume_epoch_offset}/{args.epochs}] "
+            f"(abs_epoch={epoch}) "
             f"train_loss={train_stats['train_loss']:.4f} "
             f"val_loss={val_stats['val_loss']:.4f} "
             f"val_acc={val_stats['val_accuracy']:.4f} "
