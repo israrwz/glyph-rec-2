@@ -252,6 +252,8 @@ class GlyphRasterDataset(Dataset):
         super().__init__()
         self.cfg = config
         self._rng = random.Random(config.seed)
+        self._epoch = 0  # For augmentation variety across epochs
+        self._global_call_counter = 0  # For augmentation variety within epoch
         self._rows: List[GlyphRow] = fetch_glyph_rows(
             db_path=config.db_path,
             limit=config.limit,
@@ -489,6 +491,10 @@ class GlyphRasterDataset(Dataset):
     def __len__(self) -> int:
         return len(self._rows)
 
+    def set_epoch(self, epoch: int):
+        """Update epoch number for augmentation variety across epochs."""
+        self._epoch = epoch
+
     def get_glyph_meta(self, glyph_id: int) -> Optional[Dict[str, Any]]:
         """
         Return normalization metadata captured by the Rasterizer for a glyph:
@@ -585,7 +591,15 @@ class GlyphRasterDataset(Dataset):
                     )
 
                 if self.cfg.augment:
-                    local_rng = random.Random(self.cfg.seed + row.glyph_id)
+                    # Use epoch + counter for variety across epochs
+                    self._global_call_counter += 1
+                    seed = (
+                        self.cfg.seed
+                        + row.glyph_id * 10000
+                        + self._epoch * 1000000
+                        + self._global_call_counter
+                    )
+                    local_rng = random.Random(seed)
                     img = _augment_tensor(
                         img,
                         rng=local_rng,
@@ -614,7 +628,15 @@ class GlyphRasterDataset(Dataset):
 
         img = self._rasterize(row)
         if self.cfg.augment:
-            local_rng = random.Random(self.cfg.seed + row.glyph_id)
+            # Use epoch + counter for variety across epochs
+            self._global_call_counter += 1
+            seed = (
+                self.cfg.seed
+                + row.glyph_id * 10000
+                + self._epoch * 1000000
+                + self._global_call_counter
+            )
+            local_rng = random.Random(seed)
             img = _augment_tensor(
                 img,
                 rng=local_rng,

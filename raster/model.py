@@ -298,11 +298,18 @@ def build_glyph_levit_128s(
         drop_path=drop_path,
     )
 
+    # Replace BN_Linear classifier with plain Linear for stability with many classes
+    # BatchNorm before classification can be unstable with high class counts and small batches
+    if config.num_classes > 0:
+        in_features = embed_dim[-1]  # 384 for LeViT_128S
+        backbone.head = nn.Linear(in_features, config.num_classes)
+        # Initialize with same scheme as BN_Linear used
+        nn.init.normal_(backbone.head.weight, std=0.02)
+        nn.init.zeros_(backbone.head.bias)
+
     # Feature hook: capture pooled (pre-head) features.
     # Implementation detail: we register a forward hook on backbone.head's
-    # BatchNorm (first module inside BN_Linear) input is AFTER pooling + BN,
-    # but we want just BEFORE classification BN? To keep it simple,
-    # we capture right after the global mean (with minimal intrusion) by
+    # input. We capture right after the global mean (with minimal intrusion) by
     # patching backbone.forward. Slight override wrapper below.
 
     original_forward = backbone.forward

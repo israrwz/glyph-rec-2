@@ -240,6 +240,71 @@ def parse_args(argv=None):
 
 
 # ---------------------------------------------------------------------------
+# Supervised Contrastive Loss
+# ---------------------------------------------------------------------------
+
+
+def supervised_contrastive_loss(
+    embeddings: torch.Tensor,
+    labels: torch.Tensor,
+    temperature: float = 0.07,
+) -> torch.Tensor:
+    """
+    Supervised contrastive loss for L2-normalized embeddings.
+
+    For each sample i:
+    - Positives: all j with labels[j] == labels[i], j != i
+    - Negatives: all j with labels[j] != labels[i]
+
+    Loss: -log(sum(exp(sim_pos)) / sum(exp(sim_all_except_self)))
+
+    embeddings: (B, D) L2-normalized vectors
+    labels: (B,) integer class labels
+    temperature: scaling factor for similarities
+    """
+    device = embeddings.device
+    B = embeddings.size(0)
+
+    # Compute pairwise cosine similarities (already L2-normalized)
+    sim_matrix = embeddings @ embeddings.t()  # (B, B)
+    sim_matrix = sim_matrix / temperature
+
+    # Create masks
+    labels_eq = labels.unsqueeze(0) == labels.unsqueeze(1)  # (B, B) same class
+    labels_eq = labels_eq.float()
+
+    # Exclude self-similarity (no in-place operation)
+    mask = torch.eye(B, device=device, dtype=torch.bool)
+    labels_eq = labels_eq.masked_fill(mask, 0)
+
+    # For numerical stability, subtract max
+    sim_max, _ = sim_matrix.max(dim=1, keepdim=True)
+    sim_matrix = sim_matrix - sim_max.detach()
+
+    # Compute exp(sim)
+    exp_sim = torch.exp(sim_matrix)
+
+    # Sum over positives
+    pos_sum = (exp_sim * labels_eq).sum(dim=1)  # (B,)
+
+    # Sum over all except self
+    exp_sim_masked = exp_sim.masked_fill(mask, 0)
+    all_sum = exp_sim_masked.sum(dim=1)  # (B,)
+
+    # Loss for samples that have at least one positive
+    has_pos = labels_eq.sum(dim=1) > 0  # (B,) samples with positives
+
+    if has_pos.sum() == 0:
+        return torch.tensor(0.0, device=device)
+
+    # -log(pos / all)
+    log_prob = torch.log(pos_sum[has_pos] / (all_sum[has_pos] + 1e-8) + 1e-8)
+    loss = -log_prob.mean()
+
+    return loss
+
+
+# ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
 
@@ -534,9 +599,12 @@ def train_one_epoch(
     arcface_scale: float = 30.0,
     grad_clip: float = 0.0,
     log_interval: int = 200,  # batches between progress prints (0 disables)
+    emb_loss_weight: float = 0.3,  # weight for embedding contrastive loss
 ) -> Dict[str, Any]:
     model.train()
     total_loss = 0.0
+    total_ce_loss = 0.0
+    total_emb_loss = 0.0
     total_samples = 0
     ce = nn.CrossEntropyLoss()
     last_grad_norm = 0.0
@@ -593,15 +661,24 @@ def train_one_epoch(
         optimizer.zero_grad()
         out = model(imgs)
         logits = out["logits"]
-        # Prefer backbone raw features for ArcFace so dimensionality matches classifier weight matrix
+        embeddings = out["embedding"]  # (B, 128) L2-normalized
+
+        # Classification loss
         feats_for_margin = getattr(model, "_last_backbone_features", None)
         if feats_for_margin is None:
             # Fallback to embedding head output (may trigger dim guard in _arcface_loss)
-            feats_for_margin = out["embedding"]
+            feats_for_margin = embeddings
         if arcface_margin > 0.0:
-            loss = _arcface_loss(logits, labels, feats_for_margin)
+            ce_loss = _arcface_loss(logits, labels, feats_for_margin)
         else:
-            loss = ce(logits, labels)
+            ce_loss = ce(logits, labels)
+
+        # Embedding contrastive loss
+        emb_loss = supervised_contrastive_loss(embeddings, labels, temperature=0.07)
+
+        # Combined loss
+        loss = ce_loss + emb_loss_weight * emb_loss
+
         loss.backward()
         if grad_clip and grad_clip > 0:
             # Capture norm before clipping
@@ -637,10 +714,14 @@ def train_one_epoch(
             first_batch_reported = True
         bs = imgs.size(0)
         total_loss += loss.item() * bs
+        total_ce_loss += ce_loss.item() * bs
+        total_emb_loss += emb_loss.item() * bs
         total_samples += bs
 
     return {
         "train_loss": total_loss / max(1, total_samples),
+        "ce_loss": total_ce_loss / max(1, total_samples),
+        "emb_loss": total_emb_loss / max(1, total_samples),
         "grad_norm": last_grad_norm,
         "grad_norm_unclipped": last_unclipped_grad_norm,
     }
@@ -861,16 +942,22 @@ def main(argv=None) -> int:
             schedule=args.lr_schedule,
         )
 
+        # Update dataset epoch for augmentation variety
+        if hasattr(train_ds, "set_epoch"):
+            train_ds.set_epoch(epoch)
+
         t0 = time.time()
-        train_stats = train_one_epoch(
+        # Train
+        train_metrics = train_one_epoch(
             model,
             train_loader,
             optimizer,
-            device,
+            device=args.device,
             arcface_margin=args.arcface_margin,
             arcface_scale=args.arcface_scale,
             grad_clip=args.grad_clip,
             log_interval=args.log_interval,
+            emb_loss_weight=0.3,  # Weight for embedding contrastive loss
         )
         val_stats = validate(model, val_loader, device)
 
@@ -893,7 +980,7 @@ def main(argv=None) -> int:
             "epoch": epoch,
             "lr_backbone": optimizer.param_groups[0]["lr"],
             "lr_head": optimizer.param_groups[1]["lr"],
-            **train_stats,
+            **train_metrics,
             **val_stats,
             **retrieval_stats,
             "epoch_time_sec": epoch_time,
@@ -941,11 +1028,13 @@ def main(argv=None) -> int:
         summary = (
             f"[EPOCH {epoch - resume_epoch_offset}/{args.epochs}] "
             f"(abs_epoch={epoch}) "
-            f"train_loss={train_stats['train_loss']:.4f} "
+            f"train_loss={train_metrics['train_loss']:.4f} "
+            f"ce_loss={train_metrics.get('ce_loss', 0.0):.4f} "
+            f"emb_loss={train_metrics.get('emb_loss', 0.0):.4f} "
             f"val_loss={val_stats['val_loss']:.4f} "
             f"val_acc={val_stats['val_accuracy']:.4f} "
-            f"grad_norm={train_stats['grad_norm']:.2f} "
-            f"grad_unclipped={train_stats.get('grad_norm_unclipped', 0.0):.2f} "
+            f"grad_norm={train_metrics['grad_norm']:.2f} "
+            f"grad_unclipped={train_metrics.get('grad_norm_unclipped', 0.0):.2f} "
         )
         if retrieval_stats:
             summary += (
