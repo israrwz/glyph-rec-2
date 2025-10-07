@@ -998,6 +998,129 @@ Objectives
 
 24.3 Algorithmic Fidelity Checks
 - Command indices must be in [0, n_commands-1]; EOS exclusively for padding/tail.
+
+---
+
+## 25. Zero-Embedding Failure (Legacy Builder) & Migration to Hierarchical Faithful (New)
+
+### 25.1 Summary of Issue
+During large-batch extraction with the legacy (non-hierarchical) builder + hierarchical checkpoint (`hierarchical_ordered.pth.tar`), nearly all embeddings were zero after pooling:
+- Pre-L2 norms: mean=0.0, zero_rows=64/64 in most batches.
+- Occasional single non-zero row indicated sporadic valid first token placement.
+- tokens_non_eos counts were healthy (≈30–40), so geometry existed; collapse was due to mask semantics, not empty contours.
+
+### 25.2 Root Cause
+The hierarchical model expects grouped (G,S) sequences with at least one non-EOS command at the start of each glyph’s first used group. The legacy builder:
+- Prefills with EOS tokens (shared PAD/EOS index) at position 0.
+- Causes `_get_padding_mask` (first-EOS = sequence termination) to mark all tokens invalid.
+- Pooling then divides by (effective_length=0) → protected from NaN by clamp but yields zero vectors.
+
+### 25.3 Validation Fix
+Switching to the hierarchical faithful builder (`--faithful-hier`) restored non-zero embeddings:
+- Buckets grouped by actual group_count (g_used).
+- Encode stats: row_norm_mean ≈ 18–19 before normalization; zero_rows=0.
+- Utilization improved within buckets (no full (8×30) padding wastage).
+This confirms the collapse was a structural input mismatch, not a numerical instability.
+
+### 25.4 Actionable Guidelines
+1. Always use `--faithful-hier` (or future canonical hierarchical builder) with hierarchical checkpoints (encode_stages=2).
+2. Ensure first command of first group is a valid move (synthetic insert if parser omits).
+3. Reject or repair glyphs whose first usable group starts with EOS.
+4. Avoid mixing legacy flat builder and hierarchical checkpoints in production metrics.
+
+### 25.5 Diagnostic Checklist (Smoke Test of N=128)
+- Print encode stats per bucket: confirm `zero_rows=0`.
+- Verify distribution of g_used (expect 1–6+ not all identical).
+- Check sample command sequences: index 0 should be a non-EOS command token (e.g., MOVE).
+- Confirm post-L2 norms are ~1.0 with negligible zero-norm rows.
+
+### 25.6 30K Hierarchical Faithful Extraction Instructions
+Command (CPU example):
+```
+python -m src.scripts.run_embed \
+  --db dataset/glyphs.db \
+  --pretrained deepsvg/pretrained/hierarchical_ordered.pth.tar \
+  --faithful-hier \
+  --limit 30000 \
+  --batch-size 32 \
+  --strategy norm_v2 \
+  --out artifacts/hier_faithful30000_embeds.pt \
+  --meta artifacts/hier_faithful30000_meta.jsonl \
+  --device cpu \
+  --progress-every 1000
+```
+Post-run sanity:
+```
+python - <<'PY'
+import torch
+E=torch.load('artifacts/hier_faithful30000_embeds.pt')
+import numpy as np
+norms=E.norm(dim=1)
+print("Shape:", E.shape, "Zero-norm fraction:", float((norms<1e-8).sum())/len(norms))
+PY
+```
+Expected zero-norm fraction ≈ 0.0.
+
+### 25.7 PCA (Optional) for Projection
+```
+python -m src.scripts.pca_postprocess \
+  --embeds artifacts/hier_faithful30000_embeds.pt \
+  --fit-pca --pca-dim 128 \
+  --out-dir artifacts/pca/hier_faithful30000
+```
+
+### 25.8 500-Epoch Projection Training (30K)
+Baseline curriculum with hard negatives:
+```
+python -m src.scripts.train_projection_head \
+  --embeds artifacts/hier_faithful30000_embeds.pt \
+  --meta artifacts/hier_faithful30000_meta.jsonl \
+  --pca-model artifacts/pca/hier_faithful30000 \
+  --remove-top 5 \
+  --augment-features \
+  --epochs 500 \
+  --curriculum coarse:50,fine:100,hybrid:350 \
+  --hybrid-alpha-start 0.88 --hybrid-alpha-end 0.60 \
+  --temp-start 0.20 --temp-end 0.05 --temp-mode cosine \
+  --cluster-weighting inv_sqrt \
+  --hard-neg --hard-neg-scale 1.7 \
+  --batch-size 256 \
+  --log-var-every 50 --var-topk 10 \
+  --out-proj artifacts/projection/head_faithful30k_500ep.pt \
+  --out-embeds artifacts/projection/hier_faithful30000_proj_500ep.pt \
+  --log-json artifacts/projection/train_log_faithful30k_500ep.json \
+  --device cpu
+```
+
+### 25.9 Post-Training Evaluation
+```
+python -m src.scripts.similarity_eval \
+  --embeds artifacts/hier_faithful30000_embeds.pt \
+  --meta artifacts/hier_faithful30000_meta.jsonl \
+  --k 10 --dual-metrics --min-cluster 3 \
+  --json-out artifacts/reports/base_faithful30k_similarity.json
+
+python -m src.scripts.similarity_eval \
+  --embeds artifacts/projection/hier_faithful30000_proj_500ep.pt \
+  --meta artifacts/hier_faithful30000_meta.jsonl \
+  --k 10 --dual-metrics --min-cluster 3 \
+  --json-out artifacts/reports/proj_faithful30k_500ep_similarity.json
+```
+
+### 25.10 Next Optimization Levers (If Fine Metrics Still Flat)
+- Try `--remove-top 3` variant.
+- Increase hard negative scale (1.7 → 1.9) if coarse improves but fine stagnates.
+- Adjust alpha decay (hold 0.88 for first 150 hybrid epochs before decaying).
+- Introduce periodic embedding snapshots (future script patch).
+
+### 25.11 Acceptance for “Healthy Extraction” Milestone
+- Zero-norm fraction < 0.001.
+- Encode per-bucket zero_rows=0.
+- Similarity eval runs without warnings; no NaNs.
+- Coarse effect size > 0 (positive separation).
+- Fine effect size shows measurable upward trend when using hard negatives (target interim > 0.03 on 30K).
+
+(End Section 25)
 - Args: raw indices in valid bin range; PAD_VAL=-1; rely on embedding layer’s (args+1) shift.
 - No negative indices < -1; no values ≥ args_dim.
 - Mask sanity:

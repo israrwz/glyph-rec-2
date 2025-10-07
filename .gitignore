@@ -1,4 +1,5 @@
-/dataset
+/datasetxx
 **/__pycache__
-/artifacts
+**/artifacts
+raster/checkpoints
 .DS_Store
