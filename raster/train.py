@@ -139,6 +139,12 @@ def parse_args(argv=None):
         help="If >0, enable ArcFace-like angular margin loss with given margin (m, radians).",
     )
     ap.add_argument(
+        "--emb-loss-weight",
+        type=float,
+        default=0.3,
+        help="Weight for embedding contrastive loss (0.0 disables). Recommended: 0.1-0.5. Lower for high class counts.",
+    )
+    ap.add_argument(
         "--pre-raster-workers",
         type=int,
         default=0,
@@ -873,6 +879,27 @@ def main(argv=None) -> int:
     n_params = count_parameters(model)
     print(f"[INFO] Model params: {n_params / 1e6:.3f}M")
 
+    # Print training configuration
+    print(f"[INFO] Training config:")
+    print(f"  - Batch size: {args.batch_size}")
+    print(f"  - Classes: {len(train_ds.label_to_index)}")
+    print(
+        f"  - Samples per class (avg): {len(train_ds) / len(train_ds.label_to_index):.1f}"
+    )
+    print(
+        f"  - Expected positive pairs per batch: ~{(args.batch_size**2 / len(train_ds.label_to_index)):.1f}"
+    )
+    print(f"  - Embedding loss weight: {args.emb_loss_weight}")
+    if args.emb_loss_weight == 0.0:
+        print(f"    WARNING: Embedding loss disabled (weight=0.0)")
+    elif args.batch_size < len(train_ds.label_to_index) * 0.5:
+        print(
+            f"    WARNING: Batch size may be too small for effective contrastive learning"
+        )
+        print(
+            f"    Recommendation: Use --batch-size >= {int(len(train_ds.label_to_index) * 0.5)} or --emb-loss-weight 0.1"
+        )
+
     # Resume logic (F): load checkpoint weights & report prior val accuracy if available
     resume_epoch_offset = 0
     if args.resume:
@@ -957,7 +984,7 @@ def main(argv=None) -> int:
             arcface_scale=args.arcface_scale,
             grad_clip=args.grad_clip,
             log_interval=args.log_interval,
-            emb_loss_weight=0.3,  # Weight for embedding contrastive loss
+            emb_loss_weight=args.emb_loss_weight,
         )
         val_stats = validate(model, val_loader, device)
 
