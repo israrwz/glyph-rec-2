@@ -638,8 +638,9 @@ def make_train_val_split(
     train_rows = [dataset._rows[i] for i in indices[val_size:]]
     val_rows = [dataset._rows[i] for i in indices[:val_size]]
 
-    def _clone_with_rows(rows: List[GlyphRow]) -> GlyphRasterDataset:
+    def _clone_with_rows(rows: List[GlyphRow], is_val: bool) -> GlyphRasterDataset:
         # Build a lightweight cfg clone that signals row adoption
+        # If this is the validation split, disable augmentation.
         cfg = dataset.cfg
         adopt_cfg = DatasetConfig(
             db_path=cfg.db_path,
@@ -653,7 +654,7 @@ def make_train_val_split(
             fit_mode=cfg.fit_mode,
             hole_strategy=cfg.hole_strategy,
             clip_out_of_bounds=cfg.clip_out_of_bounds,
-            augment=cfg.augment,
+            augment=cfg.augment if not is_val else False,
             translate_px=cfg.translate_px,
             scale_jitter=cfg.scale_jitter,
             contrast_jitter=cfg.contrast_jitter,
@@ -695,7 +696,9 @@ def make_train_val_split(
         clone._cache_order.clear()
         return clone
 
-    return _clone_with_rows(train_rows), _clone_with_rows(val_rows)
+    return _clone_with_rows(train_rows, is_val=False), _clone_with_rows(
+        val_rows, is_val=True
+    )
 
 
 # ---------------------------------------------------------------------------

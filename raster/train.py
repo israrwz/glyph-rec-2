@@ -229,6 +229,13 @@ def parse_args(argv=None):
         default=200,
         help="Batches between intra-epoch progress prints (0 disables).",
     )
+    ap.add_argument(
+        "--lr-schedule",
+        type=str,
+        default="cosine",
+        choices=["cosine", "constant"],
+        help="LR schedule: 'cosine' (warmup + cosine decay) or 'constant' (flat LR after warmup).",
+    )
     return ap.parse_args(argv)
 
 
@@ -371,15 +378,23 @@ def create_optimizer(model: torch.nn.Module, args) -> torch.optim.Optimizer:
 
 
 def adjust_lrs(
-    optimizer, epoch: int, max_epochs: int, base_lrs: List[float], warmup_epochs: int
+    optimizer,
+    epoch: int,
+    max_epochs: int,
+    base_lrs: List[float],
+    warmup_epochs: int,
+    schedule: str = "cosine",
 ):
     """
-    Cosine schedule with optional linear warmup for first `warmup_epochs`.
+    LR schedule with optional linear warmup for first `warmup_epochs`.
     epoch here is zero-based.
+    schedule: 'cosine' (decay after warmup) or 'constant' (flat after warmup).
     """
     for pg, base_lr in zip(optimizer.param_groups, base_lrs):
         if warmup_epochs > 0 and epoch < warmup_epochs:
             lr = base_lr * float(epoch + 1) / float(warmup_epochs)
+        elif schedule == "constant":
+            lr = base_lr
         else:
             effective_epoch = epoch - warmup_epochs
             effective_total = max(1, max_epochs - warmup_epochs)
@@ -525,6 +540,8 @@ def train_one_epoch(
     total_samples = 0
     ce = nn.CrossEntropyLoss()
     last_grad_norm = 0.0
+    last_unclipped_grad_norm = 0.0
+    first_batch_reported = False
 
     def _arcface_loss(
         logits: torch.Tensor, labels: torch.Tensor, feats: torch.Tensor
@@ -587,8 +604,13 @@ def train_one_epoch(
             loss = ce(logits, labels)
         loss.backward()
         if grad_clip and grad_clip > 0:
+            # Capture norm before clipping
+            last_unclipped_grad_norm = _global_grad_norm(model)
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        last_grad_norm = _global_grad_norm(model)
+            last_grad_norm = _global_grad_norm(model)
+        else:
+            last_unclipped_grad_norm = _global_grad_norm(model)
+            last_grad_norm = last_unclipped_grad_norm
         optimizer.step()
         # Intra-epoch progress (prints every log_interval batches, if enabled)
         if log_interval > 0 and (
@@ -602,6 +624,9 @@ def train_one_epoch(
                 f"[BATCH] prog={batch_idx}/{total_batches if total_batches > 0 else '?'} "
                 f"loss={loss.item():.4f}"
             )
+        if not first_batch_reported:
+            print(f"[DEBUG] first batch shape={tuple(imgs.shape)}")
+            first_batch_reported = True
         bs = imgs.size(0)
         total_loss += loss.item() * bs
         total_samples += bs
@@ -609,6 +634,7 @@ def train_one_epoch(
     return {
         "train_loss": total_loss / max(1, total_samples),
         "grad_norm": last_grad_norm,
+        "grad_norm_unclipped": last_unclipped_grad_norm,
     }
 
 
@@ -782,7 +808,12 @@ def main(argv=None) -> int:
     train_start = time.time()
     for epoch in range(resume_epoch_offset + 1, resume_epoch_offset + args.epochs + 1):
         adjust_lrs(
-            optimizer, epoch - 1, args.epochs, base_lrs, warmup_epochs=warmup_epochs
+            optimizer,
+            epoch - 1,
+            args.epochs,
+            base_lrs,
+            warmup_epochs=warmup_epochs,
+            schedule=args.lr_schedule,
         )
 
         t0 = time.time()
@@ -842,13 +873,13 @@ def main(argv=None) -> int:
                 extra={"val_accuracy": best_val_acc},
             )
 
-        if args.save_every > 0 and epoch % args.save_every == 0:
-            save_checkpoint(
-                model,
-                str(checkpoints_dir / f"epoch_{epoch}.pt"),
-                step=epoch,
-                extra={"val_accuracy": val_stats["val_accuracy"]},
-            )
+        # Always save a per-epoch checkpoint (epoch_{epoch}.pt) regardless of --save-every
+        save_checkpoint(
+            model,
+            str(checkpoints_dir / f"epoch_{epoch}.pt"),
+            step=epoch,
+            extra={"val_accuracy": val_stats["val_accuracy"]},
+        )
         # Save/update optimizer state (full resume support)
         torch.save(
             {
@@ -869,6 +900,7 @@ def main(argv=None) -> int:
             f"val_loss={val_stats['val_loss']:.4f} "
             f"val_acc={val_stats['val_accuracy']:.4f} "
             f"grad_norm={train_stats['grad_norm']:.2f} "
+            f"grad_unclipped={train_stats.get('grad_norm_unclipped', 0.0):.2f} "
         )
         if retrieval_stats:
             summary += (
