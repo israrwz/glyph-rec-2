@@ -541,6 +541,11 @@ class GlyphRasterDataset(Dataset):
         """
         row = self._rows[idx]
 
+        # Track fast path hits for debugging
+        if not hasattr(self, "_fast_path_hits"):
+            self._fast_path_hits = 0
+            self._slow_path_hits = 0
+
         # Fast path: preraster tensor or memmap lookup
         if self._preraster_tensor is not None or self._preraster_memmap is not None:
             if not hasattr(self, "_gid_to_pr_idx"):
@@ -563,6 +568,22 @@ class GlyphRasterDataset(Dataset):
                         img = torch.from_numpy(raw).to(torch.float32) / 255.0
                     else:
                         img = torch.from_numpy(raw).to(torch.float32)
+
+                self._fast_path_hits += 1
+
+                # Debug logging for first few fast path hits
+                if self._fast_path_hits <= 3:
+                    img_min = float(img.min())
+                    img_max = float(img.max())
+                    img_mean = float(img.mean())
+                    nonzero = int((img > 0.01).sum())
+                    print(
+                        f"[DATASET] Fast path hit #{self._fast_path_hits}: glyph_id={row.glyph_id}, "
+                        f"label='{row.label}', img shape={tuple(img.shape)}, "
+                        f"min={img_min:.4f}, max={img_max:.4f}, mean={img_mean:.4f}, "
+                        f"nonzero_px={nonzero}/{img.numel()}"
+                    )
+
                 if self.cfg.augment:
                     local_rng = random.Random(self.cfg.seed + row.glyph_id)
                     img = _augment_tensor(
@@ -585,6 +606,12 @@ class GlyphRasterDataset(Dataset):
                 }
 
         # Slow path: no preraster cache available -> rasterize now
+        self._slow_path_hits += 1
+        if self._slow_path_hits <= 3:
+            print(
+                f"[DATASET] Slow path (rasterize) hit #{self._slow_path_hits} for glyph_id={row.glyph_id}"
+            )
+
         img = self._rasterize(row)
         if self.cfg.augment:
             local_rng = random.Random(self.cfg.seed + row.glyph_id)

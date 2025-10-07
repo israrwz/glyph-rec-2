@@ -625,7 +625,15 @@ def train_one_epoch(
                 f"loss={loss.item():.4f}"
             )
         if not first_batch_reported:
-            print(f"[DEBUG] first batch shape={tuple(imgs.shape)}")
+            batch_min = float(imgs.min())
+            batch_max = float(imgs.max())
+            batch_mean = float(imgs.mean())
+            batch_nonzero = int((imgs > 0.01).sum())
+            print(
+                f"[DEBUG] first batch shape={tuple(imgs.shape)}, "
+                f"min={batch_min:.4f}, max={batch_max:.4f}, mean={batch_mean:.4f}, "
+                f"nonzero_px={batch_nonzero}/{imgs.numel()}"
+            )
             first_batch_reported = True
         bs = imgs.size(0)
         total_loss += loss.item() * bs
@@ -690,48 +698,85 @@ def main(argv=None) -> int:
     print(
         f"[INFO] Train size={len(train_ds)} | Val size={len(val_ds)} | Num classes={len(train_ds.label_to_index)}"
     )
-    # Memmap integrity quick check: if reused memmap appears entirely blank at a few sampled indices,
-    # rebuild an in-memory tensor fallback (prevents silent all-zero inputs).
-    try:
-        if (
-            hasattr(train_ds, "_preraster_memmap")
-            and train_ds._preraster_memmap is not None
-        ):
-            mm = train_ds._preraster_memmap
-            H = train_ds.cfg.image_size
-            W = train_ds.cfg.image_size
-            sample_indices = [0, len(mm) // 4, len(mm) // 2, (3 * len(mm)) // 4]
-            zero_like = 0
-            for si in sample_indices:
-                if si < len(mm):
-                    if mm[si].sum() == 0:
-                        zero_like += 1
-            if zero_like == len(sample_indices):
-                print(
-                    "[WARN] Detected all sampled preraster memmap blocks are zero; rebuilding in-memory preraster tensor."
-                )
-                import torch as _torch
 
-                rebuilt = []
-                for row in train_ds._rows:
-                    t = train_ds._rasterize(row)
-                    rebuilt.append((t.clamp(0, 1) * 255).to(_torch.uint8))
-                train_ds._preraster_tensor = _torch.stack(rebuilt, dim=0)
-                train_ds._preraster_memmap = None
-                # Mirror to val split if it shares adoption
-                if (
-                    hasattr(val_ds, "_preraster_memmap")
-                    and val_ds._preraster_memmap is not None
-                ):
-                    val_rebuilt = []
-                    for row in val_ds._rows:
-                        t = val_ds._rasterize(row)
-                        val_rebuilt.append((t.clamp(0, 1) * 255).to(_torch.uint8))
-                    val_ds._preraster_tensor = _torch.stack(val_rebuilt, dim=0)
-                    val_ds._preraster_memmap = None
-                print("[INFO] In-memory preraster rebuild complete (memmap replaced).")
+    # Enhanced rasterization integrity check with visualization
+    print("[INFO] Performing rasterization integrity check...")
+    try:
+        # Sample a few items from the dataset and check their statistics
+        sample_indices = [
+            0,
+            len(train_ds) // 4,
+            len(train_ds) // 2,
+            (3 * len(train_ds)) // 4,
+            len(train_ds) - 1,
+        ]
+        samples_valid = 0
+        samples_blank = 0
+
+        for idx in sample_indices:
+            if idx >= len(train_ds):
+                continue
+            try:
+                sample = train_ds[idx]
+                img = sample["image"]  # Should be (1, H, W) tensor
+                img_min = float(img.min())
+                img_max = float(img.max())
+                img_mean = float(img.mean())
+                img_std = float(img.std())
+                nonzero_count = int((img > 0.01).sum())
+                total_pixels = img.numel()
+
+                if img_max > 0.01 and nonzero_count > 10:
+                    samples_valid += 1
+                    if samples_valid == 1:
+                        print(
+                            f"[INTEGRITY] Sample {idx} (glyph_id={sample['glyph_id']}, label='{sample['raw_label']}'): "
+                            f"shape={tuple(img.shape)}, min={img_min:.4f}, max={img_max:.4f}, "
+                            f"mean={img_mean:.4f}, std={img_std:.4f}, nonzero={nonzero_count}/{total_pixels}"
+                        )
+                else:
+                    samples_blank += 1
+                    print(
+                        f"[WARN] Sample {idx} appears blank: min={img_min:.4f}, max={img_max:.4f}, nonzero={nonzero_count}"
+                    )
+            except Exception as e:
+                print(f"[ERROR] Failed to load sample {idx}: {e}")
+
+        if samples_blank >= len(sample_indices) - 1:
+            print(
+                "[FATAL] Most sampled images are blank! Rasterization pipeline may be broken."
+            )
+            print(
+                "[FATAL] Check preraster memmap file or disable --pre-raster-mmap to force re-rasterization."
+            )
+            raise RuntimeError(
+                "Rasterization integrity check failed: most samples are blank"
+            )
+        elif samples_valid > 0:
+            print(
+                f"[INTEGRITY] Check passed: {samples_valid}/{len(sample_indices)} samples valid, {samples_blank} blank"
+            )
+        else:
+            print(
+                "[WARN] Could not verify rasterization integrity (no valid samples found)"
+            )
+
+        # Additional check for val dataset
+        if len(val_ds) > 0:
+            val_sample = val_ds[0]
+            val_img = val_sample["image"]
+            val_mean = float(val_img.mean())
+            val_nonzero = int((val_img > 0.01).sum())
+            print(
+                f"[INTEGRITY] Val sample 0: mean={val_mean:.4f}, nonzero={val_nonzero}/{val_img.numel()}, augment={val_ds.cfg.augment}"
+            )
+
     except Exception as _e:
-        print(f"[WARN] Memmap integrity check skipped due to error: {_e}")
+        print(f"[ERROR] Rasterization integrity check failed: {_e}")
+        import traceback
+
+        traceback.print_exc()
+        raise
 
     # A. Save label mapping
     label_map_path = artifacts_dir / "label_to_index.json"
