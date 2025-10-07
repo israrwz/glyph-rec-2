@@ -406,6 +406,17 @@ class GlyphRasterDataset(Dataset):
                         f"[DATASET] Pre-rasterizing {total} glyphs (in-memory dtype={self.cfg.pre_raster_dtype})..."
                     )
             imgs = [] if not self.cfg.pre_raster_mmap else None
+            total_rows = len(self._rows)
+            progress_every = max(1, total_rows // 100)  # ~2% granularity
+            printed = 0
+
+            def _report(i):
+                nonlocal printed
+                if (i + 1) % progress_every == 0 or (i + 1) == total_rows:
+                    pct = (i + 1) * 100.0 / total_rows
+                    print(f"[PRERASTER] {i + 1}/{total_rows} ({pct:.1f}%)")
+                    printed += 1
+
             # Parallel (thread) pre-rasterization if requested
             if self.cfg.pre_raster_workers and self.cfg.pre_raster_workers > 0:
                 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -425,7 +436,6 @@ class GlyphRasterDataset(Dataset):
                         try:
                             arr = fut.result()
                         except Exception:
-                            # Fallback blank tensor on failure
                             arr = torch.zeros(
                                 1,
                                 H,
@@ -436,6 +446,7 @@ class GlyphRasterDataset(Dataset):
                             mm[i] = arr.cpu().numpy()
                         else:
                             imgs.append(arr)
+                        _report(i)
             else:
                 for i, r in enumerate(self._rows):
                     t = self._rasterize(r)
@@ -447,6 +458,7 @@ class GlyphRasterDataset(Dataset):
                         mm[i] = arr.cpu().numpy()
                     else:
                         imgs.append(arr)
+                    _report(i)
             if mm is not None:
                 mm.flush()
                 self._preraster_memmap = mm
