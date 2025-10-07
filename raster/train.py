@@ -548,7 +548,11 @@ def train_one_epoch(
         with torch.no_grad():
             W_norm = torch.nn.functional.normalize(W, dim=1)
         feat_norm = torch.nn.functional.normalize(feats.detach(), dim=1)
-        # Cosine logits
+        if feat_norm.shape[1] != W_norm.shape[1]:
+            # Safeguard: feature dim (e.g. 128) mismatches classifier weight dim (e.g. 384)
+            # Fallback to standard CE on original logits.
+            return ce(logits, labels)
+        # Cosine logits (dimensions now aligned)
         cos = torch.matmul(feat_norm, W_norm.t()).clamp(-1.0, 1.0)  # (B,C)
         # Add margin to target classes
         theta = torch.acos(cos.clamp(-1 + 1e-7, 1 - 1e-7))
@@ -564,9 +568,11 @@ def train_one_epoch(
         optimizer.zero_grad()
         out = model(imgs)
         logits = out["logits"]
-        feats_for_margin = out[
-            "embedding"
-        ]  # normalized already; still normalize again in loss
+        # Prefer backbone raw features for ArcFace so dimensionality matches classifier weight matrix
+        feats_for_margin = getattr(model, "_last_backbone_features", None)
+        if feats_for_margin is None:
+            # Fallback to embedding head output (may trigger dim guard in _arcface_loss)
+            feats_for_margin = out["embedding"]
         if arcface_margin > 0.0:
             loss = _arcface_loss(logits, labels, feats_for_margin)
         else:
