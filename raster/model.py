@@ -313,16 +313,21 @@ def build_glyph_levit_128s(
         x_ = x_.flatten(2).transpose(1, 2)
         x_ = backbone.blocks(x_)
         x_ = x_.mean(1)
-        if hasattr(backbone, "distillation") and backbone.distillation:
-            logits = backbone.head(x_), backbone.head_dist(x_)
-        else:
-            logits = backbone.head(x_)
+
+        # CRITICAL: Store features BEFORE head consumption to maintain gradient flow
         # Use weakref to avoid creating a module cycle (which caused recursion in .to())
         wr_ref = getattr(backbone, "_wrapper_ref", None)
         if wr_ref is not None:
             wrapper = wr_ref()
             if wrapper is not None:
+                # Store x_ while it's still part of the computation graph
                 setattr(wrapper, "_last_backbone_features", x_)
+
+        # Now compute logits using the same x_ (gradients will flow back through both paths)
+        if hasattr(backbone, "distillation") and backbone.distillation:
+            logits = backbone.head(x_), backbone.head_dist(x_)
+        else:
+            logits = backbone.head(x_)
         return logits
 
     backbone.forward = patched_forward  # type: ignore
