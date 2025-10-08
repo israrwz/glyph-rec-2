@@ -280,7 +280,7 @@ def supervised_contrastive_loss(
 
     # Create masks
     labels_eq = labels.unsqueeze(0) == labels.unsqueeze(1)  # (B, B) same class
-    labels_eq = labels_eq.float()
+    labels_eq = labels_eq.float().to(device)
 
     # Exclude self-similarity (no in-place operation)
     mask = torch.eye(B, device=device, dtype=torch.bool)
