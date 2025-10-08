@@ -1,6 +1,8 @@
 # Google Colab Notebook Cells
 Copy and paste these cells into a new Google Colab notebook.
 
+**Note:** These cells call the training functions directly in Python (not via subprocess), so you'll see all output streamed live in the notebook cell as training progresses. This is much better for interactive use than spawning separate processes.
+
 ---
 
 ## Cell 1: Mount Drive & Setup
@@ -32,56 +34,57 @@ print(f"   Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} 
 ## Cell 2: Full Training (531k samples, 20-40 minutes)
 
 ```python
-import subprocess
 import sys
+from pathlib import Path
 
-# Configuration
-config = {
-    'db': 'dataset/glyphs.db',
-    'limit': 531000,
-    'epochs': 20,
-    'batch_size': 1024,
-    'val_frac': 0.1,
-    'num_workers': 2,
-    'device': 'cuda',
-    'pre_rasterize': True,
-    'pre_raster_mmap': True,
-    'pre_raster_mmap_path': 'preraster_full_531k_u8.dat',
-    'min_label_count': 2,
-    'drop_singletons': True,
-    'lr_backbone': 0.0015,
-    'lr_head': 0.0030,
-    'weight_decay': 0.008,
-    'warmup_frac': 0.02,
-    'lr_schedule': 'constant',
-    'emb_loss_weight': 0.25,
-    'retrieval_cap': 5000,
-    'retrieval_every': 5,
-    'log_interval': 200,
-    'suppress_warnings': True,
-}
+# Add project root to path if needed
+project_root = Path.cwd()
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
 
-# Build command
-cmd = [sys.executable, '-m', 'raster.train']
-for key, value in config.items():
-    arg_name = f"--{key.replace('_', '-')}"
-    if isinstance(value, bool):
-        if value:
-            cmd.append(arg_name)
-    else:
-        cmd.extend([arg_name, str(value)])
+# Import the training function directly
+from raster.train import main as train_main
+
+# Configuration as command-line style arguments
+args = [
+    '--db', 'dataset/glyphs.db',
+    '--limit', '531000',
+    '--epochs', '20',
+    '--batch-size', '1024',
+    '--val-frac', '0.1',
+    '--num-workers', '2',
+    '--device', 'cuda',
+    '--pre-rasterize',
+    '--pre-raster-mmap',
+    '--pre-raster-mmap-path', 'preraster_full_531k_u8.dat',
+    '--min-label-count', '2',
+    '--drop-singletons',
+    '--lr-backbone', '0.0015',
+    '--lr-head', '0.0030',
+    '--weight-decay', '0.008',
+    '--warmup-frac', '0.02',
+    '--lr-schedule', 'constant',
+    '--emb-loss-weight', '0.25',
+    '--retrieval-cap', '5000',
+    '--retrieval-every', '5',
+    '--log-interval', '200',
+    '--suppress-warnings',
+]
 
 print("🚀 Starting training...")
 print(f"Expected: 5-10% val acc, 55-75% top-10 retrieval")
 print(f"Runtime: 20-40 minutes on T4/A100\n")
 
-# Run training
-result = subprocess.run(cmd)
-
-if result.returncode == 0:
-    print("\n✅ Training complete! Check raster/checkpoints/best.pt")
-else:
-    print(f"\n❌ Training failed with code {result.returncode}")
+# Call training function directly (returns 0 on success)
+try:
+    status = train_main(args)
+    if status == 0:
+        print("\n✅ Training complete! Check raster/checkpoints/best.pt")
+    else:
+        print(f"\n⚠️ Training finished with status code: {status}")
+except Exception as e:
+    print(f"\n❌ Training failed: {e}")
+    raise
 ```
 
 ---
@@ -89,37 +92,43 @@ else:
 ## Cell 3: Quick Test (100k samples, 1-2 hours)
 
 ```python
-import subprocess
 import sys
+from pathlib import Path
+
+# Add project root to path if needed
+project_root = Path.cwd()
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
+# Import the training function directly
+from raster.train import main as train_main
 
 # Smaller config for quick validation
-config = {
-    'db': 'dataset/glyphs.db',
-    'limit': 100000,
-    'epochs': 15,
-    'batch_size': 1024,
-    'device': 'cuda',
-    'pre_rasterize': True,
-    'emb_loss_weight': 0.25,
-    'retrieval_cap': 3000,
-    'retrieval_every': 3,
-    'suppress_warnings': True,
-}
-
-# Build and run command
-cmd = [sys.executable, '-m', 'raster.train']
-for key, value in config.items():
-    arg_name = f"--{key.replace('_', '-')}"
-    if isinstance(value, bool):
-        if value:
-            cmd.append(arg_name)
-    else:
-        cmd.extend([arg_name, str(value)])
+args = [
+    '--db', 'dataset/glyphs.db',
+    '--limit', '100000',
+    '--epochs', '15',
+    '--batch-size', '1024',
+    '--device', 'cuda',
+    '--pre-rasterize',
+    '--emb-loss-weight', '0.25',
+    '--retrieval-cap', '3000',
+    '--retrieval-every', '3',
+    '--suppress-warnings',
+]
 
 print("🧪 Quick test: 100k samples")
 print("Expected: 2-4% val acc\n")
 
-subprocess.run(cmd)
+try:
+    status = train_main(args)
+    if status == 0:
+        print("\n✅ Training complete!")
+    else:
+        print(f"\n⚠️ Training finished with status code: {status}")
+except Exception as e:
+    print(f"\n❌ Training failed: {e}")
+    raise
 ```
 
 ---
@@ -261,17 +270,17 @@ else:
 
 ### If You Hit Memory Issues
 ```python
-# Reduce batch size
-config['batch_size'] = 512
+# Reduce batch size in Cell 2 or 3
+# Change '--batch-size', '1024' to '--batch-size', '512'
 
 # Or reduce workers
-config['num_workers'] = 0
+# Change '--num-workers', '2' to '--num-workers', '0'
 ```
 
 ### To Resume Interrupted Training
 ```python
-# Add to config:
-config['resume'] = 'raster/checkpoints/last.pt'
+# Add to args list in Cell 2 or 3:
+args.extend(['--resume', 'raster/checkpoints/last.pt'])
 ```
 
 ---
@@ -294,7 +303,7 @@ config['resume'] = 'raster/checkpoints/last.pt'
 Enable GPU: Runtime → Change runtime type → Hardware accelerator → GPU
 
 ### "Out of memory"
-Reduce batch size: `config['batch_size'] = 512`
+Reduce batch size: Change `'--batch-size', '1024'` to `'--batch-size', '512'`
 
 ### "ModuleNotFoundError: No module named 'timm'"
 Run: `!pip install timm`
@@ -304,3 +313,6 @@ Check path and make sure database is uploaded
 
 ### Training seems slow
 Verify GPU is being used: `!nvidia-smi` should show python process
+
+### "No module named 'raster'"
+Make sure you're in the project directory and ran the sys.path.insert() code in the cell

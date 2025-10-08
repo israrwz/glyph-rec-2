@@ -271,6 +271,9 @@ def supervised_contrastive_loss(
     device = embeddings.device
     B = embeddings.size(0)
 
+    # Ensure labels are on the same device as embeddings
+    labels = labels.to(device)
+
     # Compute pairwise cosine similarities (already L2-normalized)
     sim_matrix = embeddings @ embeddings.t()  # (B, B)
     sim_matrix = sim_matrix / temperature
@@ -665,6 +668,8 @@ def train_one_epoch(
         imgs = batch["images"].to(device)
         labels = batch["labels"].to(device)
         joining_groups = batch.get("joining_groups", None)
+        if joining_groups is not None:
+            joining_groups = joining_groups.to(device)
 
         optimizer.zero_grad()
         out = model(imgs)
