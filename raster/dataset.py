@@ -617,6 +617,8 @@ class GlyphRasterDataset(Dataset):
                     "glyph_id": row.glyph_id,
                     "font_hash": row.font_hash,
                     "raw_label": row.label,
+                    "joining_group": row.joining_group,
+                    "char_class": row.char_class,
                 }
 
         # Slow path: no preraster cache available -> rasterize now
@@ -654,6 +656,8 @@ class GlyphRasterDataset(Dataset):
             "glyph_id": row.glyph_id,
             "font_hash": row.font_hash,
             "raw_label": row.label,
+            "joining_group": row.joining_group,
+            "char_class": row.char_class,
         }
 
 
@@ -760,6 +764,7 @@ def simple_collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     Collate function for DataLoader:
     - Stack images
     - Stack labels
+    - Stack joining_groups (for contrastive loss)
     - Keep metadata lists
     """
     imgs = torch.stack([b["image"] for b in batch], dim=0)  # (B,1,H,W)
@@ -767,12 +772,42 @@ def simple_collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     glyph_ids = [b["glyph_id"] for b in batch]
     font_hashes = [b["font_hash"] for b in batch]
     raw_labels = [b["raw_label"] for b in batch]
+    joining_groups_raw = [b.get("joining_group") for b in batch]
+    char_classes_raw = [b.get("char_class") for b in batch]
+
+    # Build hybrid contrastive groups:
+    # - For Arabic letters (meaningful joining_group): use joining_group
+    # - For NO_JOIN or null (mixed bag): use char_class instead
+    # This prevents mixing Latin, diacritics, punctuation, etc.
+    contrastive_groups_raw = []
+    for jg, cc in zip(joining_groups_raw, char_classes_raw):
+        if jg and jg != "NO_JOIN":
+            # Arabic letter with meaningful joining group
+            contrastive_groups_raw.append(jg)
+        elif cc:
+            # NO_JOIN or null: use char_class (latin, diacritic, punctuation, etc.)
+            contrastive_groups_raw.append(f"cc_{cc}")
+        else:
+            # Fallback: use NO_JOIN
+            contrastive_groups_raw.append("NO_JOIN")
+
+    # Convert to indices
+    unique_groups = sorted(set(contrastive_groups_raw))
+    if unique_groups:
+        group_to_idx = {g: i for i, g in enumerate(unique_groups)}
+        joining_groups = torch.tensor(
+            [group_to_idx[g] for g in contrastive_groups_raw], dtype=torch.long
+        )
+    else:
+        joining_groups = None
+
     return {
         "images": imgs,
         "labels": labels,
         "glyph_ids": glyph_ids,
         "font_hashes": font_hashes,
         "raw_labels": raw_labels,
+        "joining_groups": joining_groups,
     }
 
 

@@ -82,6 +82,8 @@ class GlyphRow:
     font_hash: str
     label: str
     contours_json: str
+    joining_group: Optional[str] = None
+    char_class: Optional[str] = None
     upem: Optional[int] = None
     ascent: Optional[int] = None
     descent: Optional[int] = None
@@ -97,7 +99,7 @@ class GlyphRow:
 # ---------------------------------------------------------------------------
 
 _DEFAULT_GLYPH_QUERY = """
-SELECT glyph_id, f_id AS font_hash, label, contours
+SELECT glyph_id, f_id AS font_hash, label, contours, joining_group, char_class
 FROM glyphs
 WHERE contours IS NOT NULL
 LIMIT ?
@@ -146,6 +148,8 @@ def fetch_glyph_rows(
                    g.f_id AS font_hash,
                    g.label,
                    g.contours,
+                   g.joining_group,
+                   g.char_class,
                    f.upem,
                    f.ascent,
                    f.descent,
@@ -162,21 +166,22 @@ def fetch_glyph_rows(
 
     rows: List[GlyphRow] = []
     for r in cur.fetchall():
-        upem_val = r[4] if len(r) > 4 else None
         rows.append(
             GlyphRow(
-                int(r[0]),
-                str(r[1]),
-                str(r[2]),
-                r[3],
-                int(r[4]) if r[4] is not None else None,
-                int(r[5]) if r[5] is not None else None,
-                int(r[6]) if r[6] is not None else None,
-                int(r[7]) if r[7] is not None else None,
-                int(r[8]) if r[8] is not None else None,
-                int(r[9]) if r[9] is not None else None,
-                int(r[10]) if r[10] is not None else None,
-                int(r[11]) if r[11] is not None else None,
+                glyph_id=int(r[0]),
+                font_hash=str(r[1]),
+                label=str(r[2]),
+                contours_json=r[3],
+                joining_group=str(r[4]) if r[4] is not None else None,
+                char_class=str(r[5]) if r[5] is not None else None,
+                upem=int(r[6]) if r[6] is not None else None,
+                ascent=int(r[7]) if r[7] is not None else None,
+                descent=int(r[8]) if r[8] is not None else None,
+                typo_ascent=int(r[9]) if r[9] is not None else None,
+                typo_descent=int(r[10]) if r[10] is not None else None,
+                x_height=int(r[11]) if r[11] is not None else None,
+                cap_height=int(r[12]) if r[12] is not None else None,
+                line_gap=int(r[13]) if r[13] is not None else None,
             )
         )
     conn.close()

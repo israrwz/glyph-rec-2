@@ -664,12 +664,14 @@ def train_one_epoch(
     for batch_idx, batch in enumerate(loader, start=1):
         imgs = batch["images"].to(device)
         labels = batch["labels"].to(device)
+        joining_groups = batch.get("joining_groups", None)
+
         optimizer.zero_grad()
         out = model(imgs)
         logits = out["logits"]
         embeddings = out["embedding"]  # (B, 128) L2-normalized
 
-        # Classification loss
+        # Classification loss (uses fine-grained labels)
         feats_for_margin = getattr(model, "_last_backbone_features", None)
         if feats_for_margin is None:
             # Fallback to embedding head output (may trigger dim guard in _arcface_loss)
@@ -679,8 +681,14 @@ def train_one_epoch(
         else:
             ce_loss = ce(logits, labels)
 
-        # Embedding contrastive loss
-        emb_loss = supervised_contrastive_loss(embeddings, labels, temperature=0.07)
+        # Embedding contrastive loss (uses coarse joining_groups for better clustering)
+        if joining_groups is not None and emb_loss_weight > 0:
+            emb_loss = supervised_contrastive_loss(
+                embeddings, joining_groups, temperature=0.07
+            )
+        else:
+            # Fallback to labels if joining_groups not available
+            emb_loss = supervised_contrastive_loss(embeddings, labels, temperature=0.07)
 
         # Combined loss
         loss = ce_loss + emb_loss_weight * emb_loss
@@ -882,23 +890,18 @@ def main(argv=None) -> int:
     # Print training configuration
     print(f"[INFO] Training config:")
     print(f"  - Batch size: {args.batch_size}")
-    print(f"  - Classes: {len(train_ds.label_to_index)}")
+    print(f"  - Classes (classification): {len(train_ds.label_to_index)}")
     print(
         f"  - Samples per class (avg): {len(train_ds) / len(train_ds.label_to_index):.1f}"
     )
-    print(
-        f"  - Expected positive pairs per batch: ~{(args.batch_size**2 / len(train_ds.label_to_index)):.1f}"
-    )
     print(f"  - Embedding loss weight: {args.emb_loss_weight}")
+    if args.emb_loss_weight > 0.0:
+        print(f"  - Contrastive grouping: HYBRID (joining_group + char_class)")
+        print(f"    • Arabic letters: grouped by joining_group (BEH, HAH, etc.)")
+        print(f"    • NO_JOIN glyphs: grouped by char_class (latin, diacritic, etc.)")
+        print(f"    • Prevents mixing Latin/diacritic/punctuation in embeddings")
     if args.emb_loss_weight == 0.0:
         print(f"    WARNING: Embedding loss disabled (weight=0.0)")
-    elif args.batch_size < len(train_ds.label_to_index) * 0.5:
-        print(
-            f"    WARNING: Batch size may be too small for effective contrastive learning"
-        )
-        print(
-            f"    Recommendation: Use --batch-size >= {int(len(train_ds.label_to_index) * 0.5)} or --emb-loss-weight 0.1"
-        )
 
     # Resume logic (F): load checkpoint weights & report prior val accuracy if available
     resume_epoch_offset = 0
