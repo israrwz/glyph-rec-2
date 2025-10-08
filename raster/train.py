@@ -272,15 +272,21 @@ def supervised_contrastive_loss(
     B = embeddings.size(0)
 
     # Ensure labels are on the same device as embeddings
-    labels = labels.to(device)
+    if labels.device != device:
+        labels = labels.to(device)
 
     # Compute pairwise cosine similarities (already L2-normalized)
     sim_matrix = embeddings @ embeddings.t()  # (B, B)
     sim_matrix = sim_matrix / temperature
 
-    # Create masks
-    labels_eq = labels.unsqueeze(0) == labels.unsqueeze(1)  # (B, B) same class
-    labels_eq = labels_eq.float().to(device)
+    # Create masks - ensure comparison happens on correct device
+    labels_expanded_0 = labels.unsqueeze(0)  # (1, B)
+    labels_expanded_1 = labels.unsqueeze(1)  # (B, 1)
+    labels_eq = (labels_expanded_0 == labels_expanded_1).float()  # (B, B) same class
+
+    # Ensure labels_eq is on the correct device
+    if labels_eq.device != device:
+        labels_eq = labels_eq.to(device)
 
     # Exclude self-similarity (no in-place operation)
     mask = torch.eye(B, device=device, dtype=torch.bool)
