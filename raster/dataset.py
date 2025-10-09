@@ -666,34 +666,92 @@ class GlyphRasterDataset(Dataset):
 # ---------------------------------------------------------------------------
 
 
+def _compute_label_coverage(train_rows: List[GlyphRow], val_rows: List[GlyphRow]):
+    from collections import Counter
+
+    tr_counter = Counter(r.label for r in train_rows)
+    va_counter = Counter(r.label for r in val_rows)
+    val_total = len(val_rows)
+    unseen_val = sum(c for lab, c in va_counter.items() if tr_counter.get(lab, 0) == 0)
+    one_train = sum(c for lab, c in va_counter.items() if tr_counter.get(lab, 0) == 1)
+    two_train = sum(c for lab, c in va_counter.items() if tr_counter.get(lab, 0) == 2)
+    small_train_labels = [lab for lab, c in tr_counter.items() if c <= 2]
+    print(
+        f"[COVERAGE] val_samples={val_total} "
+        f"unseen_val={unseen_val} ({(unseen_val / val_total * 100 if val_total else 0):.2f}%) "
+        f"val_from_train_freq1={one_train} ({(one_train / val_total * 100 if val_total else 0):.2f}%) "
+        f"val_from_train_freq2={two_train} ({(two_train / val_total * 100 if val_total else 0):.2f}%)"
+    )
+    print(
+        f"[COVERAGE] train_labels_le2={len(small_train_labels)}/{len(tr_counter)} "
+        f"({(len(small_train_labels) / len(tr_counter) * 100 if tr_counter else 0):.2f}%)"
+    )
+
+
 def make_train_val_split(
     dataset: GlyphRasterDataset,
     val_fraction: float = 0.1,
     seed: int = 42,
+    stratified_min1: bool = False,
+    coverage_report: bool = False,
 ) -> Tuple[GlyphRasterDataset, GlyphRasterDataset]:
     """
     Produce two view-like dataset objects sharing underlying rows but with
     disjoint index lists.
 
-    For simplicity we implement this by shallow copying and replacing _rows.
+    Modes:
+      - Standard random split (original behavior)
+      - Stratified split (stratified_min1=True): guarantees every label with >=2
+        total samples contributes at least 1 sample to training (and at least 1
+        to validation if frequency >=2), and singletons are forced into training
+        (so validation does not contain unseen labels).
 
     NOTE: Label vocab is the same across splits for consistent classification head.
     """
     if not (0.0 < val_fraction < 1.0):
         raise ValueError("val_fraction must be in (0,1).")
 
-    n = len(dataset._rows)
-    indices = list(range(n))
     rng = random.Random(seed)
-    rng.shuffle(indices)
-    val_size = int(n * val_fraction)
-    val_idx = set(indices[:val_size])
-    train_rows = [dataset._rows[i] for i in indices[val_size:]]
-    val_rows = [dataset._rows[i] for i in indices[:val_size]]
+
+    if not stratified_min1:
+        # Original random shuffle path
+        n = len(dataset._rows)
+        indices = list(range(n))
+        rng.shuffle(indices)
+        val_size = int(n * val_fraction)
+        val_idx = set(indices[:val_size])
+        train_rows = [dataset._rows[i] for i in indices[val_size:]]
+        val_rows = [dataset._rows[i] for i in indices[:val_size]]
+    else:
+        from collections import defaultdict
+
+        label_to_rows: Dict[str, List[GlyphRow]] = defaultdict(list)
+        for r in dataset._rows:
+            label_to_rows[r.label].append(r)
+        train_rows = []
+        val_rows = []
+        for lab, rows in label_to_rows.items():
+            rows_local = rows[:]
+            rng.shuffle(rows_local)
+            freq = len(rows_local)
+            if freq == 1:
+                # Put singleton only in training (avoid unreachable label in val)
+                train_rows.extend(rows_local)
+                continue
+            # Desired validation count
+            raw_val = int(round(freq * val_fraction))
+            raw_val = min(freq - 1, max(1, raw_val))  # ensure at least 1 train & 1 val
+            val_part = rows_local[:raw_val]
+            train_part = rows_local[raw_val:]
+            if len(train_part) == 0:  # safety fallback
+                train_part = [val_part.pop()]  # move one back to train
+            train_rows.extend(train_part)
+            val_rows.extend(val_part)
+        # Shuffle final aggregates for stochastic ordering
+        rng.shuffle(train_rows)
+        rng.shuffle(val_rows)
 
     def _clone_with_rows(rows: List[GlyphRow], is_val: bool) -> GlyphRasterDataset:
-        # Build a lightweight cfg clone that signals row adoption
-        # If this is the validation split, disable augmentation.
         cfg = dataset.cfg
         adopt_cfg = DatasetConfig(
             db_path=cfg.db_path,
@@ -715,18 +773,17 @@ def make_train_val_split(
             blur_prob=cfg.blur_prob,
             blur_kernel=cfg.blur_kernel,
             cache_size=cfg.cache_size,
-            pre_rasterize=False,  # prevent rebuild
+            pre_rasterize=False,
             pre_raster_dtype=cfg.pre_raster_dtype,
             pre_raster_mmap=cfg.pre_raster_mmap,
             pre_raster_mmap_path=cfg.pre_raster_mmap_path,
             min_label_count=cfg.min_label_count,
-            drop_singletons=False,  # already filtered
+            drop_singletons=False,
             verbose_stats=False,
             enable_margin_targets=cfg.enable_margin_targets,
             seed=cfg.seed,
             label_filter=None,
         )
-        # Internal adoption markers
         setattr(adopt_cfg, "_adopt_rows", True)
         setattr(
             adopt_cfg,
@@ -743,11 +800,12 @@ def make_train_val_split(
         clone.label_to_index = dataset.label_to_index
         clone.index_to_label = dataset.index_to_label
         clone.glyph_id_order = [r.glyph_id for r in rows]
-        # Share preraster buffers directly (already assigned in constructor via adoption flags)
-        # Reset per-clone caches
         clone._cache.clear()
         clone._cache_order.clear()
         return clone
+
+    if coverage_report:
+        _compute_label_coverage(train_rows, val_rows)
 
     return _clone_with_rows(train_rows, is_val=False), _clone_with_rows(
         val_rows, is_val=True

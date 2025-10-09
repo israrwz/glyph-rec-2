@@ -464,6 +464,9 @@ def _make_font_disjoint_split(
 
 def build_loaders(
     args,
+    *,
+    stratified_min1: bool = False,
+    coverage_report: bool = False,
 ) -> Tuple[GlyphRasterDataset, GlyphRasterDataset, DataLoader, DataLoader]:
     ds_cfg = DatasetConfig(
         db_path=args.db,
@@ -484,12 +487,14 @@ def build_loaders(
     )
     full_ds = GlyphRasterDataset(ds_cfg)
     if args.font_disjoint:
-        train_ds, val_ds = _make_font_disjoint_split(
-            full_ds, val_fraction=args.val_frac, seed=args.seed
-        )
+        train_ds, val_ds = _make_font_disjoint_split(full_ds, args.val_frac, args.seed)
     else:
         train_ds, val_ds = make_train_val_split(
-            full_ds, val_fraction=args.val_frac, seed=args.seed
+            full_ds,
+            val_fraction=args.val_frac,
+            seed=args.seed,
+            stratified_min1=stratified_min1,
+            coverage_report=coverage_report,
         )
 
     # Enable pin_memory for faster CPU->GPU transfers when using CUDA
@@ -976,7 +981,11 @@ def main(argv=None) -> int:
             args.no_augment = True
     if getattr(args, "augment_mode", "dataset") == "none":
         args.no_augment = True
-    train_ds, val_ds, train_loader, val_loader = build_loaders(args)
+    # Use stratified split ensuring every label with >=2 samples has at least 1 in training
+    # and report coverage statistics.
+    train_ds, val_ds, train_loader, val_loader = build_loaders(
+        args, stratified_min1=True, coverage_report=True
+    )
     print(
         f"[INFO] Train size={len(train_ds)} | Val size={len(val_ds)} | Num classes={len(train_ds.label_to_index)}"
     )
