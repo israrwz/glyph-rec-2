@@ -119,6 +119,7 @@ class DatasetConfig:
     drop_singletons: bool = (
         False  # Convenience: if True and min_label_count==1, treat as min_label_count=2
     )
+    exclude_shaped: bool = False  # If True, drop labels containing '_shaped' BEFORE prerasterization to avoid cache misalignment
     verbose_stats: bool = True  # Print frequency audit
     # Margin loss scaffolding (phase 2)
     enable_margin_targets: bool = (
@@ -262,6 +263,17 @@ class GlyphRasterDataset(Dataset):
         )
         if not self._rows:
             raise RuntimeError("No glyph rows fetched from database.")
+        # Early shaped-label exclusion (must occur BEFORE any pre-rasterization)
+        if self.cfg.exclude_shaped:
+            before = len(self._rows)
+            self._rows = [r for r in self._rows if "_shaped" not in r.label]
+            removed = before - len(self._rows)
+            if removed > 0 and self.cfg.verbose_stats:
+                print(
+                    f"[DATASET] Excluded {removed} shaped label rows (remain={len(self._rows)})"
+                )
+            if not self._rows:
+                raise RuntimeError("All glyph rows filtered out by exclude_shaped.")
         # Initialize cache bookkeeping early (needed because pre-raster calls _rasterize)
         self.cache_enabled = self.cfg.cache_size > 0
         self._cache: Dict[int, torch.Tensor] = {}

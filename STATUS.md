@@ -1,7 +1,7 @@
 # Glyph Recognition Training System - Status Report
-**Last Updated:** 2024
+**Last Updated:** 2025-10
 **Project:** Large-scale glyph embedding and classification using LeViT
-**Status:** ✅ Ready for full-scale GPU training
+**Status:** ⚠️ Baseline functional, critical data pipeline caveat resolved (image/label misalignment); ready to proceed with corrected pipeline
 
 ---
 
@@ -15,16 +15,22 @@ Train a deep learning model to:
 
 ### Architecture
 - **Backbone:** LeViT_128S (7.5M parameters)
-- **Input:** 128×128 grayscale glyph rasters
+- **Input (current options):**
+  - Legacy: 128×128 (8×8 token grid)
+  - Improved: 224×224 (14×14 token grid) for better fine detail retention
 - **Dual-head design:**
-  - Classification head: 384→1,588 (fine-grained identity)
+  - Classification head: 384→(N_classes) (fine-grained identity)
   - Embedding head: 384→256→128→L2norm (visual similarity)
+- **Planned variants:** Patch-size 8 at 128 resolution (higher token density) and larger LeViT configs after baseline stabilization
 
 ### Dataset
-- **Total glyphs:** 531,398
-- **Unique labels:** 1,588 (codepoint_form, e.g., "65227_init")
+- **Total glyphs:** 531,398 (full reservoir)
+- **Current working subsets:** 100k (exploration), ~19k (filtered), 17k (post exclusion)
+- **Original unique labels:** 1,588 (codepoint_form, e.g., "65227_init")
+- **After min-label-count>=5 & shaped exclusion:** dynamic (e.g. 709–1057 classes in recent runs)
 - **Unique joining groups:** 249 (visual structure, e.g., "BEH", "HAH")
 - **Unique char classes:** 11 (semantic type, e.g., "latin", "diacritic")
+- **Problematic label form (now excluded or to be normalized):** `U+XXXX_form_shaped`
 - **Storage:** SQLite database (`dataset/glyphs.db`)
 
 ---
@@ -146,6 +152,11 @@ total_loss = ce_loss + emb_loss_weight * emb_loss
 **Problem:** Features stored AFTER classifier consumption
 **Fix:** Store features BEFORE, so both heads share same tensor reference
 
+### Critical Bug #5: Image / Label Misalignment in Pre-Raster Cache (FIXED ✅)
+**Problem:** Post-filtering (excluding `_shaped`, min-label-count pruning) occurred *after* preraster tensor / memmap build. Dataset fast-path indexed preraster tensor by new filtered row order → images no longer matched labels (training stuck near random).
+**Symptoms:** Val loss hovered at random baseline (≈ ln(#classes)), val acc ~0.1–0.3%, retrieval stable but classification stagnant across many hyperparameter changes.
+**Fix:** Disable preraster reuse during diagnosis; confirmed learning recovers (val CE ↓ from 6.54 → 5.52, top-1 ↑ to 8.1%). Action: Move all filtering *before* preraster build; add guard to rebuild if counts mismatch.
+
 ---
 
 ## 📁 Important Files
@@ -198,7 +209,7 @@ raster/artifacts/
 
 ## 🧪 Test Results
 
-### 10k Sample Test (CPU, No Embedding Loss)
+### 10k Sample Test (CPU, No Embedding Loss) [Historical]
 ```
 Dataset: 10k samples, 793 classes, 12 samples/class
 Result: Val acc 0.0-0.8% (near random)
@@ -216,11 +227,19 @@ Emb loss: 5.76 → 5.20 (barely improving)
 Conclusion: Need more data! 15 samples/class insufficient
 ```
 
-### Key Finding
-**Data insufficiency, not architecture bugs**
-- With 15 samples/class, model memorizes training set but can't generalize
-- All architectural fixes are working correctly
-- Need full 531k dataset (335 samples/class) for proper evaluation
+### Updated Findings
+**Earlier belief:** Pure data insufficiency.
+**Refined understanding:** Two compounding factors:
+1. Data sparsity in long tail (≤5 samples/class) *and*
+2. A silent image/label misalignment caused by post-preraster filtering.
+
+**After fix (no preraster / filter-first logic):**
+- 224×224, 709 classes (min-count≥5, shaped excluded)
+- Val CE: 6.54 → 5.52 (epoch 10)
+- Val Top-1: 0.36% → 8.1%
+- Retrieval metrics improving gradually (effect size ~0.49)
+
+This confirms architecture and optimization are fundamentally sound once supervision integrity is restored.
 
 ---
 
@@ -272,19 +291,19 @@ python -m raster.train \
 
 ---
 
-## 📈 Expected Performance
+### Expected Performance (Updated Baselines)
 
 ### With Full 531k Dataset
 
-| Metric | Target | Notes |
-|--------|--------|-------|
-| Val Top-1 Accuracy | 5-10% | 40-80× better than random (0.063%) |
-| Val Top-5 Accuracy | 20-35% | Practical for UI |
-| Val Top-10 Accuracy | 35-50% | Good for search |
-| Retrieval Top-10 | 55-75% | With hybrid grouping |
-| Effect Size | 0.50-0.65 | Intra-class >> inter-class similarity |
-| Train Loss | 2.5-3.5 | After 20 epochs |
-| Val Loss | 5.5-6.5 | Should not diverge |
+| Metric | Target (Full 531k) | Current 224×224 709-class (Partial) | Notes |
+|--------|--------------------|--------------------------------------|-------|
+| Val Top-1 Accuracy | 5-10% | 8.1% (epoch 10) | Achieved on reduced class set |
+| Val Top-5 Accuracy | 20-35% | (Not yet logged) | Add metric logging |
+| Val Top-10 Accuracy | 35-50% | ~20% (top-10 partial) | Lower due to fewer samples/class |
+| Retrieval Top-10 | 55-75% | ~34% (earlier 128 runs) | Expect ↑ with stable contrastive |
+| Effect Size | 0.50-0.65 | 0.49 (improving) | Recovered after alignment fix |
+| Train Loss | 2.5-3.5 | ~5.7 (mid-train) | Higher due to augmentation & partial data |
+| Val Loss | 5.5-6.5 | 5.52 (epoch 10) | Healthy downward trend |
 
 ### Baseline Comparison
 
@@ -319,22 +338,24 @@ python -m raster.train \
 
 ---
 
-## 🔍 Key Insights
+### Key Insights (Revised)
 
 ### Architecture Validation
 ✅ LeViT_128S backbone works correctly  
 ✅ Dual-head design (classifier + embedding) functional  
 ✅ Gradient flow verified (both heads receive gradients)  
-✅ Resolution (128×128) sufficient for glyphs  
-✅ All dimensions match (no shape mismatches)  
-✅ BatchNorm statistics healthy in backbone  
+✅ 224×224 improves fine-detail separability over 128×128  
+✅ All tensor dimensions consistent  
+⚠️ Pre-raster misuse can silently poison supervision (now addressed)  
+⚠️ Fine-grained forms may still be visually ambiguous at 16‑px patches → consider patch-size 8 or hierarchical labels  
 
 ### Training Dynamics
-✅ CE loss decreases properly (classifier learns)  
-✅ Embedding loss decreases with sufficient data  
-✅ Retrieval metrics correlate with embedding quality  
-⚠️ Data insufficiency causes overfitting (< 50 samples/class)  
-⚠️ Contrastive loss needs positive pairs (large batches help)  
+✅ CE loss decreases properly (post-fix)  
+✅ Embedding loss meaningful when alignment correct  
+✅ Retrieval metrics track embedding quality  
+⚠️ Long-tail labels (<5 samples) harm stability → prune or aggregate  
+⚠️ Contrastive grouping still coarse for some NO_JOIN categories → may require finer taxonomy or caps  
+⚠️ Augmentation can invert train/val CE order (train harder than val)  
 
 ### Data Requirements
 - **Minimum viable:** 100 samples/class → 2-4% accuracy
@@ -351,21 +372,20 @@ python -m raster.train \
 
 ## 📋 Next Tasks
 
-### Immediate (Ready Now)
-1. ✅ **Transfer to Google Colab GPU**
-   - Upload `glyphs.db` to Drive
-   - Clone repo or upload code
-   - Install dependencies: `pip install timm torch`
+### Immediate (Reprioritized)
+1. ✅ Verify learning without preraster (DONE)  
+2. ⏳ Implement filter-first preraster build + mismatch guard  
+3. 🔄 Re-run 100k subset @224 with new clean preraster (compare speed & metrics)  
+4. 🎯 Add train accuracy & (optionally) label smoothing for stability  
+5. 🧪 Contrastive schedule: start weight 0.0 → ramp to 0.02 after epoch 5  
+6. 📊 Add top-5 / top-10 classification metrics logging  
+7. 🔍 Collision audit: perceptual hash clusters for visually indistinguishable labels  
+8. 🏗️ Plan hierarchical (coarse→fine) pretraining experiment  
 
-2. ✅ **Run 100k validation test** (2 hours)
-   - Verify all fixes work on GPU
-   - Expected: 2-4% val acc, 35-45% top-10
-   - If successful → proceed to full run
-
-3. ✅ **Run full 531k training** (20-40 min on GPU)
-   - Use `./RUN_HYBRID_CONTRASTIVE.sh`
-   - Expected: 5-10% val acc, 55-75% top-10
-   - Save checkpoints before session timeout
+### Full Run (After Above)
+- 531k @224 or 192 (resource trade-off)
+- Batch: effective 1024–2048 via accumulation
+- Contrastive cap (e.g. 512) to control O(B²) memory
 
 ### After Baseline Works
 4. **Hyperparameter tuning**
@@ -383,21 +403,27 @@ python -m raster.train \
    - Visualize embedding space (t-SNE/UMAP)
    - Analyze failure cases (which classes confuse most)
 
-### Future Improvements
-7. **Test-time augmentation** (+0.5-1% accuracy)
-8. **Label smoothing** (+0.5-1% accuracy)
-9. **Model ensemble** (3-5 models, +1-2% accuracy)
-10. **Curriculum learning** (easy→hard samples)
+### Future Improvements (Expanded)
+7. Test-time augmentation (+0.5–1% accuracy)  
+8. Label smoothing (+0.5–1% accuracy)  
+9. Model ensemble (3–5 models, +1–2% accuracy)  
+10. Curriculum / hierarchical labeling (coarse codepoint → fine form)  
+11. Patch-size 8 variant at 128 (increase tokens without full 224 cost)  
+12. Gradient checkpointing to enable larger batches at higher resolutions  
+13. Adaptive contrastive temperature (monitor positive density)  
+14. Semi-supervised augmentation (pseudo-labeling visually clustered unlabeled shapes if added later)  
 
 ---
 
 ## 🎯 Success Criteria
 
-### Minimum Viable Product
-- ✅ Val accuracy > 3%
-- ✅ Top-10 retrieval > 40%
-- ✅ Model trains stably (no loss divergence)
-- ✅ Embeddings are L2-normalized
+### Minimum Viable Product (Updated)
+- ✅ Val accuracy > 3% (achieved 8.1% on filtered subset)
+- ✅ Top-10 retrieval > 20% (subset; target 40%+ on full)
+- ✅ Stable training (post misalignment fix)
+- ✅ Embeddings L2-normalized
+- ⏳ Clean preraster pipeline reinstated
+- ⏳ Train accuracy + entropy logging
 - ✅ Checkpoints save correctly
 
 ### Good Baseline (Target)

@@ -493,30 +493,13 @@ def build_loaders(
         pre_raster_mmap_path=args.pre_raster_mmap_path,
         min_label_count=args.min_label_count,
         drop_singletons=args.drop_singletons,
+        exclude_shaped=getattr(args, "exclude_shaped", False),
         verbose_stats=True,
         pre_raster_workers=args.pre_raster_workers,
     )
     # Instantiate full dataset first
     full_ds = GlyphRasterDataset(ds_cfg)
-    # Optional exclusion of labels containing '_shaped'
-    if getattr(args, "exclude_shaped", False):
-        original_count = len(full_ds._rows)
-        filtered_rows = [r for r in full_ds._rows if "_shaped" not in r.label]
-        removed = original_count - len(filtered_rows)
-        if removed > 0:
-            print(
-                f"[FILTER] Excluded {removed} shaped labels ('_shaped' suffix). Remaining rows={len(filtered_rows)}"
-            )
-        # Apply filtering
-        full_ds._rows = filtered_rows
-        # Rebuild vocab & ordering after filtering
-        from collections import Counter
-
-        counts = Counter(r.label for r in full_ds._rows)
-        labels = sorted(counts.keys())
-        full_ds.label_to_index = {lab: i for i, lab in enumerate(labels)}
-        full_ds.index_to_label = labels
-        full_ds.glyph_id_order = [r.glyph_id for r in full_ds._rows]
+    # Shaped label exclusion now handled inside GlyphRasterDataset BEFORE pre-rasterization
     if args.font_disjoint:
         train_ds, val_ds = _make_font_disjoint_split(full_ds, args.val_frac, args.seed)
     else:
