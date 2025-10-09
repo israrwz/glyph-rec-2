@@ -82,6 +82,12 @@ def parse_args(argv=None):
     ap.add_argument("--epochs", type=int, default=30, help="Training epochs")
     ap.add_argument("--batch-size", type=int, default=128, help="Batch size")
     ap.add_argument(
+        "--img-size",
+        type=int,
+        default=224,
+        help="Input image size (use 224 for original LeViT token grid; previous runs used 128).",
+    )
+    ap.add_argument(
         "--val-frac", type=float, default=0.1, help="Validation fraction (0,1)"
     )
     ap.add_argument("--device", type=str, default="cpu", help="cpu or cuda:0")
@@ -477,7 +483,7 @@ def build_loaders(
         db_path=args.db,
         limit=args.limit,
         randomize_query=True,
-        image_size=128,
+        image_size=args.img_size,
         supersample=2,
         augment=not args.no_augment,
         seed=args.seed,
@@ -548,7 +554,7 @@ def build_loaders(
 
 def build_model(num_classes: int, device: str, args) -> torch.nn.Module:
     cfg = GlyphLeViTConfig(
-        img_size=128,
+        img_size=args.img_size,
         num_classes=num_classes,
         embedding_out_dim=128,
         hidden_dim=256,

@@ -4,7 +4,8 @@ model.py
 Lightweight LeViT_128S wrapper specialized for raster glyph embeddings.
 
 Goals:
-- Instantiate a LeViT_128S backbone at img_size=128 (rather than the upstream 224),
+- Instantiate a LeViT_128S backbone at a configurable img_size (default 224 to match
+  original spatial token grid; 128 remains supported for faster legacy runs),
   disabling distillation and heavy augmentation assumptions.
 - Provide a compact embedding head that yields a normalized 128-D vector.
 - Support grayscale (1-channel) glyph inputs by simple replication to 3 channels
@@ -18,7 +19,7 @@ Goals:
 Source Alignment:
 - This file reads the upstream LeViT definitions directly (no code duplication of
   internal attention blocks). We call the LeViT constructor directly rather than
-  model_factory to customize img_size=128.
+  model_factory to customize the image size (e.g. 224 or 128).
 - Architecture parameters (C, D, N, X) are taken from specification['LeViT_128S'].
 
 Pretrained Weights Notice:
@@ -264,6 +265,10 @@ def build_glyph_levit_128s(
     """
     if config is None:
         config = GlyphLeViTConfig()
+    # Safety: LeViT patch embedding assumes img_size divisible by patch_size (16)
+    assert config.img_size % 16 == 0, (
+        f"img_size={config.img_size} must be a multiple of 16 (patch size) for LeViT."
+    )
 
     spec = specification["LeViT_128S"]
     # Parse spec fields
