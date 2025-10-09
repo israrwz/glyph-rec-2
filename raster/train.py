@@ -112,6 +112,11 @@ def parse_args(argv=None):
         help="Run retrieval metrics every N epochs (default: every epoch).",
     )
     ap.add_argument("--seed", type=int, default=42, help="Global RNG seed")
+    ap.add_argument(
+        "--exclude-shaped",
+        action="store_true",
+        help="Exclude glyph rows whose labels contain the suffix '_shaped' (e.g. U+062B_isol_shaped).",
+    )
     # NOTE: --pre-raster-workers defined later (single canonical definition)
     # (Removed duplicate --suppress-warnings definition; single canonical definition kept later)
     ap.add_argument(
@@ -485,6 +490,17 @@ def build_loaders(
         verbose_stats=True,
         pre_raster_workers=args.pre_raster_workers,
     )
+    # Optional exclusion of labels containing '_shaped'
+    if getattr(args, "exclude_shaped", False):
+        # Filter after initial row fetch but before any splitting
+        original_count = len(full_ds._rows)
+        filtered_rows = [r for r in full_ds._rows if "_shaped" not in r.label]
+        removed = original_count - len(filtered_rows)
+        if removed > 0:
+            print(
+                f"[FILTER] Excluded {removed} shaped labels ('_shaped' suffix). Remaining rows={len(filtered_rows)}"
+            )
+        full_ds._rows = filtered_rows
     full_ds = GlyphRasterDataset(ds_cfg)
     if args.font_disjoint:
         train_ds, val_ds = _make_font_disjoint_split(full_ds, args.val_frac, args.seed)
@@ -974,6 +990,10 @@ def main(argv=None) -> int:
     ensure_dir(log_path.parent)
 
     print(f"[INFO] Building datasets...")
+    if args.exclude_shaped:
+        print(
+            "[INFO] Shaped label exclusion enabled: rows with '_shaped' in label will be dropped."
+        )
     # Adjust dataset augment flag based on augment-mode
     if getattr(args, "augment_mode", "dataset") == "gpu":
         if not args.no_augment:
