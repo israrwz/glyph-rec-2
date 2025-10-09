@@ -814,13 +814,32 @@ def train_one_epoch(
             ce_loss = ce(logits, labels)
 
         # Embedding contrastive loss (uses coarse joining_groups for better clustering)
-        if joining_groups is not None and emb_loss_weight > 0:
-            emb_loss = supervised_contrastive_loss(
-                embeddings, joining_groups, temperature=0.07
-            )
+        if emb_loss_weight <= 0:
+            # Completely skip contrastive computation when weight is zero
+            emb_loss = torch.tensor(0.0, device=embeddings.device)
         else:
-            # Fallback to labels if joining_groups not available
-            emb_loss = supervised_contrastive_loss(embeddings, labels, temperature=0.07)
+            if joining_groups is not None:
+                emb_loss = supervised_contrastive_loss(
+                    embeddings, joining_groups, temperature=0.07
+                )
+            else:
+                # Fallback to fine labels if no coarse grouping provided
+                emb_loss = supervised_contrastive_loss(
+                    embeddings, labels, temperature=0.07
+                )
+            # One-time debug (first batch) – show positive pair statistics
+            if batch_idx == 1:
+                with torch.no_grad():
+                    tgt = joining_groups if joining_groups is not None else labels
+                    lbl_eq = tgt.unsqueeze(0) == tgt.unsqueeze(1)
+                    # Exclude self
+                    lbl_eq.fill_diagonal_(False)
+                    pos_counts = lbl_eq.sum(dim=1)
+                    if pos_counts.numel() > 0:
+                        print(
+                            f"[DEBUG] contrastive positives: min={int(pos_counts.min().item())} "
+                            f"mean={pos_counts.float().mean().item():.2f}"
+                        )
 
         # Combined loss
         loss = ce_loss + emb_loss_weight * emb_loss
