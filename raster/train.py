@@ -230,6 +230,18 @@ def parse_args(argv=None):
         help="Disable augmentations (useful for deterministic eval or caching).",
     )
     ap.add_argument(
+        "--augment-mode",
+        type=str,
+        default="dataset",
+        choices=["dataset", "gpu", "none"],
+        help="Augmentation location: 'dataset' (existing per-sample), 'gpu' (batched on GPU), 'none' (disable).",
+    )
+    ap.add_argument(
+        "--no-amp",
+        action="store_true",
+        help="Disable mixed precision (AMP). Enabled by default on CUDA.",
+    )
+    ap.add_argument(
         "--log-interval",
         type=int,
         default=200,
@@ -248,6 +260,88 @@ def parse_args(argv=None):
 # ---------------------------------------------------------------------------
 # Supervised Contrastive Loss
 # ---------------------------------------------------------------------------
+
+
+def batched_gpu_augment(
+    imgs: torch.Tensor,
+    translate_px: int = 2,
+    scale_jitter: float = 0.05,
+    contrast_jitter: float = 0.10,
+    gamma_jitter: float = 0.10,
+    blur_prob: float = 0.0,
+    blur_kernel: int = 3,
+) -> torch.Tensor:
+    """
+    Batched GPU augmentation for (B,1,H,W) images in [0,1].
+    Applied after DataLoader collation to eliminate per-sample CPU overhead.
+    All ops keep tensor on the same device/dtype (supports AMP).
+    """
+    if imgs.ndim != 4 or imgs.size(1) != 1:
+        return imgs  # safeguard
+    B, C, H, W = imgs.shape
+    device = imgs.device
+    dtype = imgs.dtype
+
+    # Geometric (scale + translation)
+    if (scale_jitter > 0) or (translate_px > 0):
+        # Random scales
+        scales = (
+            1.0 + (torch.rand(B, device=device, dtype=dtype) * 2.0 - 1.0) * scale_jitter
+        )
+        # Integer pixel shifts
+        if translate_px > 0:
+            tx = torch.randint(-translate_px, translate_px + 1, (B,), device=device)
+            ty = torch.randint(-translate_px, translate_px + 1, (B,), device=device)
+        else:
+            tx = torch.zeros(B, device=device, dtype=torch.long)
+            ty = torch.zeros(B, device=device, dtype=torch.long)
+        # Normalize shifts to [-1,1] grid space (pixel -> normalized)
+        tx_n = tx.to(dtype) * (2.0 / W)
+        ty_n = ty.to(dtype) * (2.0 / H)
+        theta = torch.zeros(B, 2, 3, device=device, dtype=dtype)
+        theta[:, 0, 0] = scales
+        theta[:, 1, 1] = scales
+        theta[:, 0, 2] = tx_n
+        theta[:, 1, 2] = ty_n
+        grid = torch.nn.functional.affine_grid(
+            theta, size=imgs.shape, align_corners=False
+        )
+        imgs = torch.nn.functional.grid_sample(
+            imgs, grid, mode="bilinear", padding_mode="zeros", align_corners=False
+        )
+
+    # Contrast jitter
+    if contrast_jitter > 0:
+        factors = (
+            1.0
+            + (torch.rand(B, 1, 1, 1, device=device, dtype=dtype) * 2.0 - 1.0)
+            * contrast_jitter
+        )
+        imgs = (imgs - 0.5) * factors + 0.5
+        imgs = imgs.clamp(0.0, 1.0)
+
+    # Gamma jitter
+    if gamma_jitter > 0:
+        gammas = (
+            1.0
+            + (torch.rand(B, 1, 1, 1, device=device, dtype=dtype) * 2.0 - 1.0)
+            * gamma_jitter
+        )
+        imgs = torch.clamp(imgs, 1e-5, 1.0) ** gammas
+        imgs = imgs.clamp(0.0, 1.0)
+
+    # Optional blur (simple mean blur, applied selectively)
+    if blur_prob > 0 and blur_kernel >= 3 and (blur_kernel % 2 == 1):
+        mask = torch.rand(B, device=device) < blur_prob
+        if mask.any():
+            k = blur_kernel
+            pad = k // 2
+            weight = torch.ones(1, 1, k, k, device=device, dtype=dtype) / (k * k)
+            idx = mask.nonzero(as_tuple=False).flatten()
+            blurred = torch.nn.functional.conv2d(imgs[idx], weight, padding=pad)
+            imgs[idx] = blurred
+
+    return imgs
 
 
 def supervised_contrastive_loss(
@@ -617,8 +711,12 @@ def train_one_epoch(
     arcface_margin: float = 0.0,
     arcface_scale: float = 30.0,
     grad_clip: float = 0.0,
-    log_interval: int = 200,  # batches between progress prints (0 disables)
-    emb_loss_weight: float = 0.3,  # weight for embedding contrastive loss
+    log_interval: int = 200,
+    emb_loss_weight: float = 0.3,
+    use_amp: bool = False,
+    scaler: "torch.cuda.amp.GradScaler | None" = None,
+    gpu_augment: bool = False,
+    gpu_aug_cfg: Dict[str, float] | None = None,
 ) -> Dict[str, Any]:
     model.train()
     # Accumulate losses on GPU to avoid synchronization
@@ -676,16 +774,34 @@ def train_one_epoch(
         return ce(scaled, labels)
 
     for batch_idx, batch in enumerate(loader, start=1):
-        imgs = batch["images"].to(device)
-        labels = batch["labels"].to(device)
+        imgs = batch["images"].to(device, non_blocking=True)
+        labels = batch["labels"].to(device, non_blocking=True)
         joining_groups = batch.get("joining_groups", None)
         if joining_groups is not None:
-            joining_groups = joining_groups.to(device)
+            joining_groups = joining_groups.to(device, non_blocking=True)
+        # Batched GPU augmentation (after move) if enabled
+        if gpu_augment:
+            imgs = batched_gpu_augment(
+                imgs,
+                translate_px=int(gpu_aug_cfg.get("translate_px", 2)),
+                scale_jitter=float(gpu_aug_cfg.get("scale_jitter", 0.05)),
+                contrast_jitter=float(gpu_aug_cfg.get("contrast_jitter", 0.10)),
+                gamma_jitter=float(gpu_aug_cfg.get("gamma_jitter", 0.10)),
+                blur_prob=float(gpu_aug_cfg.get("blur_prob", 0.0)),
+                blur_kernel=int(gpu_aug_cfg.get("blur_kernel", 3)),
+            )
 
         optimizer.zero_grad()
-        out = model(imgs)
-        logits = out["logits"]
-        embeddings = out["embedding"]  # (B, 128) L2-normalized
+        # Forward (AMP autocast)
+        autocast_ctx = (
+            torch.cuda.amp.autocast(enabled=use_amp)
+            if use_amp
+            else torch.autocast("cuda", enabled=False)
+        )
+        with autocast_ctx:
+            out = model(imgs)
+            logits = out["logits"]
+            embeddings = out["embedding"]
 
         # Classification loss (uses fine-grained labels)
         feats_for_margin = getattr(model, "_last_backbone_features", None)
@@ -709,16 +825,28 @@ def train_one_epoch(
         # Combined loss
         loss = ce_loss + emb_loss_weight * emb_loss
 
-        loss.backward()
-        if grad_clip and grad_clip > 0:
-            # Capture norm before clipping
-            last_unclipped_grad_norm = _global_grad_norm(model)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            last_grad_norm = _global_grad_norm(model)
+        if use_amp and scaler is not None:
+            scaler.scale(loss).backward()
+            if grad_clip and grad_clip > 0:
+                scaler.unscale_(optimizer)
+                last_unclipped_grad_norm = _global_grad_norm(model)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                last_grad_norm = _global_grad_norm(model)
+            else:
+                last_unclipped_grad_norm = _global_grad_norm(model)
+                last_grad_norm = last_unclipped_grad_norm
+            scaler.step(optimizer)
+            scaler.update()
         else:
-            last_unclipped_grad_norm = _global_grad_norm(model)
-            last_grad_norm = last_unclipped_grad_norm
-        optimizer.step()
+            loss.backward()
+            if grad_clip and grad_clip > 0:
+                last_unclipped_grad_norm = _global_grad_norm(model)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                last_grad_norm = _global_grad_norm(model)
+            else:
+                last_unclipped_grad_norm = _global_grad_norm(model)
+                last_grad_norm = last_unclipped_grad_norm
+            optimizer.step()
         # Intra-epoch progress (prints every log_interval batches, if enabled)
         # Only sync to CPU for logging, not every batch
         if log_interval > 0 and (
@@ -821,7 +949,14 @@ def main(argv=None) -> int:
     log_path = out_base / args.log_file
     ensure_dir(log_path.parent)
 
-    print("[INFO] Building datasets...")
+    print(f"[INFO] Building datasets...")
+    # Adjust dataset augment flag based on augment-mode
+    if getattr(args, "augment_mode", "dataset") == "gpu":
+        if not args.no_augment:
+            # Force dataset (per-sample) aug off; we'll do batched GPU aug
+            args.no_augment = True
+    if getattr(args, "augment_mode", "dataset") == "none":
+        args.no_augment = True
     train_ds, val_ds, train_loader, val_loader = build_loaders(args)
     print(
         f"[INFO] Train size={len(train_ds)} | Val size={len(val_ds)} | Num classes={len(train_ds.label_to_index)}"
@@ -964,6 +1099,10 @@ def main(argv=None) -> int:
         else:
             print(f"[WARN] --resume path not found: {args.resume}")
 
+    # AMP setup (must be defined before entering the epoch loop so scaler persists)
+    use_amp = args.device.startswith("cuda") and (not args.no_amp)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp) if use_amp else None
+
     optimizer = create_optimizer(model, args)
     base_lrs = [args.lr_backbone, args.lr_head]
     warmup_epochs = int(args.epochs * args.warmup_frac) if args.warmup_frac > 0 else 0
@@ -1021,6 +1160,17 @@ def main(argv=None) -> int:
             grad_clip=args.grad_clip,
             log_interval=args.log_interval,
             emb_loss_weight=args.emb_loss_weight,
+            use_amp=use_amp,
+            scaler=scaler,
+            gpu_augment=(getattr(args, "augment_mode", "dataset") == "gpu"),
+            gpu_aug_cfg=dict(
+                translate_px=2,
+                scale_jitter=0.05,
+                contrast_jitter=0.10,
+                gamma_jitter=0.10,
+                blur_prob=0.0,  # disable blur by default in batched path (cost/benefit)
+                blur_kernel=3,
+            ),
         )
         val_stats = validate(model, val_loader, device)
 
