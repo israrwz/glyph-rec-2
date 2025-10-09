@@ -272,25 +272,20 @@ def supervised_contrastive_loss(
     B = embeddings.size(0)
 
     # Ensure labels are on the same device as embeddings
-    if labels.device != device:
-        labels = labels.to(device)
+    labels = labels.to(device)
 
     # Compute pairwise cosine similarities (already L2-normalized)
     sim_matrix = embeddings @ embeddings.t()  # (B, B)
     sim_matrix = sim_matrix / temperature
 
-    # Create masks - ensure comparison happens on correct device
-    labels_expanded_0 = labels.unsqueeze(0)  # (1, B)
-    labels_expanded_1 = labels.unsqueeze(1)  # (B, 1)
-    labels_eq = (labels_expanded_0 == labels_expanded_1).float()  # (B, B) same class
+    # Create label equality mask directly on device (avoid intermediate tensors)
+    labels_eq = labels.unsqueeze(0) == labels.unsqueeze(1)  # (B, B) boolean
 
-    # Ensure labels_eq is on the correct device
-    if labels_eq.device != device:
-        labels_eq = labels_eq.to(device)
-
-    # Exclude self-similarity (no in-place operation)
+    # Create self-mask
     mask = torch.eye(B, device=device, dtype=torch.bool)
-    labels_eq = labels_eq.masked_fill(mask, 0)
+
+    # Exclude self-similarity from label mask
+    labels_eq = labels_eq & ~mask  # (B, B) boolean - positives excluding self
 
     # For numerical stability, subtract max
     sim_max, _ = sim_matrix.max(dim=1, keepdim=True)
@@ -299,17 +294,17 @@ def supervised_contrastive_loss(
     # Compute exp(sim)
     exp_sim = torch.exp(sim_matrix)
 
-    # Sum over positives
-    pos_sum = (exp_sim * labels_eq).sum(dim=1)  # (B,)
+    # Sum over positives (convert boolean mask to float only when needed)
+    pos_sum = (exp_sim * labels_eq.float()).sum(dim=1)  # (B,)
 
     # Sum over all except self
     exp_sim_masked = exp_sim.masked_fill(mask, 0)
     all_sum = exp_sim_masked.sum(dim=1)  # (B,)
 
     # Loss for samples that have at least one positive
-    has_pos = labels_eq.sum(dim=1) > 0  # (B,) samples with positives
+    has_pos = labels_eq.any(dim=1)  # (B,) boolean - more efficient than sum > 0
 
-    if has_pos.sum() == 0:
+    if not has_pos.any():
         return torch.tensor(0.0, device=device)
 
     # -log(pos / all)
@@ -403,12 +398,15 @@ def build_loaders(
             full_ds, val_fraction=args.val_frac, seed=args.seed
         )
 
+    # Enable pin_memory for faster CPU->GPU transfers when using CUDA
+    use_pin_memory = args.device.startswith("cuda")
+
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        pin_memory=False,
+        pin_memory=use_pin_memory,
         collate_fn=simple_collate,
         persistent_workers=True if args.num_workers > 0 else False,
     )
@@ -417,7 +415,7 @@ def build_loaders(
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        pin_memory=False,
+        pin_memory=use_pin_memory,
         collate_fn=simple_collate,
         persistent_workers=True if args.num_workers > 0 else False,
     )
@@ -594,14 +592,20 @@ def compute_retrieval_metrics(
 
 
 def _global_grad_norm(model: torch.nn.Module) -> float:
-    import math
-
-    total = 0.0
+    """Compute global gradient norm efficiently on GPU, sync once at end."""
+    # Collect all grad norms on GPU
+    norms = []
     for p in model.parameters():
         if p.grad is not None:
-            param_norm = p.grad.data.norm(2)
-            total += param_norm.item() ** 2
-    return math.sqrt(total)
+            norms.append(p.grad.data.norm(2))
+
+    if not norms:
+        return 0.0
+
+    # Stack and compute total norm on GPU
+    total_norm = torch.stack(norms).norm(2)
+    # Only sync to CPU once
+    return total_norm.item()
 
 
 def train_one_epoch(
@@ -617,9 +621,10 @@ def train_one_epoch(
     emb_loss_weight: float = 0.3,  # weight for embedding contrastive loss
 ) -> Dict[str, Any]:
     model.train()
-    total_loss = 0.0
-    total_ce_loss = 0.0
-    total_emb_loss = 0.0
+    # Accumulate losses on GPU to avoid synchronization
+    total_loss_tensor = torch.tensor(0.0, device=device)
+    total_ce_loss_tensor = torch.tensor(0.0, device=device)
+    total_emb_loss_tensor = torch.tensor(0.0, device=device)
     total_samples = 0
     ce = nn.CrossEntropyLoss()
     last_grad_norm = 0.0
@@ -715,6 +720,7 @@ def train_one_epoch(
             last_grad_norm = last_unclipped_grad_norm
         optimizer.step()
         # Intra-epoch progress (prints every log_interval batches, if enabled)
+        # Only sync to CPU for logging, not every batch
         if log_interval > 0 and (
             batch_idx % log_interval == 0 or batch_idx == len(loader)
         ):
@@ -722,31 +728,44 @@ def train_one_epoch(
                 total_batches = len(loader)
             except Exception:
                 total_batches = -1
+            # Only sync loss to CPU when logging
             print(
                 f"[BATCH] prog={batch_idx}/{total_batches if total_batches > 0 else '?'} "
                 f"loss={loss.item():.4f}"
             )
+        # Debug stats only for first batch (moved outside hot loop)
         if not first_batch_reported:
-            batch_min = float(imgs.min())
-            batch_max = float(imgs.max())
-            batch_mean = float(imgs.mean())
-            batch_nonzero = int((imgs > 0.01).sum())
-            print(
-                f"[DEBUG] first batch shape={tuple(imgs.shape)}, "
-                f"min={batch_min:.4f}, max={batch_max:.4f}, mean={batch_mean:.4f}, "
-                f"nonzero_px={batch_nonzero}/{imgs.numel()}"
-            )
+            # Defer actual printing to avoid sync in tight loop
+            first_batch_stats = {
+                "shape": tuple(imgs.shape),
+                "min": imgs.min(),
+                "max": imgs.max(),
+                "mean": imgs.mean(),
+                "nonzero": (imgs > 0.01).sum(),
+                "numel": imgs.numel(),
+            }
             first_batch_reported = True
         bs = imgs.size(0)
-        total_loss += loss.item() * bs
-        total_ce_loss += ce_loss.item() * bs
-        total_emb_loss += emb_loss.item() * bs
+        # Accumulate on GPU to avoid sync bottleneck
+        total_loss_tensor += loss.detach() * bs
+        total_ce_loss_tensor += ce_loss.detach() * bs
+        total_emb_loss_tensor += emb_loss.detach() * bs
         total_samples += bs
 
+    # Print first batch stats after loop (sync once)
+    if "first_batch_stats" in locals():
+        s = first_batch_stats
+        print(
+            f"[DEBUG] first batch shape={s['shape']}, "
+            f"min={s['min'].item():.4f}, max={s['max'].item():.4f}, mean={s['mean'].item():.4f}, "
+            f"nonzero_px={s['nonzero'].item()}/{s['numel']}"
+        )
+
+    # Only sync to CPU at epoch end
     return {
-        "train_loss": total_loss / max(1, total_samples),
-        "ce_loss": total_ce_loss / max(1, total_samples),
-        "emb_loss": total_emb_loss / max(1, total_samples),
+        "train_loss": total_loss_tensor.item() / max(1, total_samples),
+        "ce_loss": total_ce_loss_tensor.item() / max(1, total_samples),
+        "emb_loss": total_emb_loss_tensor.item() / max(1, total_samples),
         "grad_norm": last_grad_norm,
         "grad_norm_unclipped": last_unclipped_grad_norm,
     }
@@ -756,8 +775,9 @@ def train_one_epoch(
 def validate(model: torch.nn.Module, loader: DataLoader, device: str) -> Dict[str, Any]:
     model.eval()
     ce = nn.CrossEntropyLoss()
-    total_loss = 0.0
-    total_correct = 0
+    # Accumulate on GPU to avoid sync bottleneck
+    total_loss_tensor = torch.tensor(0.0, device=device)
+    total_correct_tensor = torch.tensor(0, device=device, dtype=torch.long)
     total_samples = 0
     for batch in loader:
         imgs = batch["images"].to(device)
@@ -766,13 +786,15 @@ def validate(model: torch.nn.Module, loader: DataLoader, device: str) -> Dict[st
         logits = out["logits"]
         loss = ce(logits, labels)
         preds = logits.argmax(dim=1)
-        total_correct += (preds == labels).sum().item()
+        # Accumulate on GPU
+        total_correct_tensor += (preds == labels).sum()
         bs = imgs.size(0)
         total_samples += bs
-        total_loss += loss.item() * bs
+        total_loss_tensor += loss.detach() * bs
+    # Only sync to CPU at end
     return {
-        "val_loss": total_loss / max(1, total_samples),
-        "val_accuracy": total_correct / max(1, total_samples),
+        "val_loss": total_loss_tensor.item() / max(1, total_samples),
+        "val_accuracy": total_correct_tensor.item() / max(1, total_samples),
         "val_samples": total_samples,
     }
 
@@ -1046,13 +1068,14 @@ def main(argv=None) -> int:
                 extra={"val_accuracy": best_val_acc},
             )
 
-        # Always save a per-epoch checkpoint (epoch_{epoch}.pt) regardless of --save-every
-        save_checkpoint(
-            model,
-            str(checkpoints_dir / f"epoch_{epoch}.pt"),
-            step=epoch,
-            extra={"val_accuracy": val_stats["val_accuracy"]},
-        )
+        # Only save per-epoch checkpoint every save_every epochs (reduce I/O overhead)
+        if args.save_every > 0 and epoch % args.save_every == 0:
+            save_checkpoint(
+                model,
+                str(checkpoints_dir / f"epoch_{epoch}.pt"),
+                step=epoch,
+                extra={"val_accuracy": val_stats["val_accuracy"]},
+            )
         # Save/update optimizer state (full resume support)
         torch.save(
             {
