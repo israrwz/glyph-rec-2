@@ -45,6 +45,7 @@ import json
 import math
 import os
 import time
+import gc
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -265,6 +266,21 @@ def parse_args(argv=None):
         choices=["cosine", "constant"],
         help="LR schedule: 'cosine' (warmup + cosine decay) or 'constant' (flat LR after warmup).",
     )
+    ap.add_argument(
+        "--free-gpu-after",
+        action="store_true",
+        help="If set, explicitly free CUDA memory at end (del model, empty_cache, gc.collect).",
+    )
+    ap.add_argument(
+        "--no-empty-cache-on-exit",
+        action="store_true",
+        help="Skip torch.cuda.empty_cache() during free-gpu-after (for debugging allocator state).",
+    )
+    ap.add_argument(
+        "--preraster-stable",
+        action="store_true",
+        help="Disable random DB row ordering so preraster memmap path can be reused deterministically (avoid rebuild on Kaggle).",
+    )
     return ap.parse_args(argv)
 
 
@@ -482,7 +498,7 @@ def build_loaders(
     ds_cfg = DatasetConfig(
         db_path=args.db,
         limit=args.limit,
-        randomize_query=True,
+        randomize_query=not getattr(args, "preraster_stable", False),
         image_size=args.img_size,
         supersample=2,
         augment=not args.no_augment,
@@ -977,6 +993,11 @@ def ensure_dir(p: Path):
 def main(argv=None) -> int:
     args = parse_args(argv)
     set_seed(args.seed)
+    # Prepare for exception-safe cleanup
+    cleanup_cuda = args.free_gpu_after and args.device.startswith("cuda")
+    model = None
+    optimizer = None
+    try:
 
     out_base = Path(args.out_dir)
     checkpoints_dir = out_base / "checkpoints"
@@ -1315,6 +1336,27 @@ def main(argv=None) -> int:
     print(f"[INFO] Logs written to {log_path}")
     print(f"[INFO] Best checkpoint: {checkpoints_dir / 'best.pt'}")
     return 0
+    finally:
+        if cleanup_cuda:
+            print("[INFO] Freeing CUDA memory (finalize)...")
+            try:
+                del model
+            except Exception:
+                pass
+            try:
+                del optimizer
+            except Exception:
+                pass
+            try:
+                if not getattr(args, "no_empty_cache_on_exit", False):
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+            try:
+                gc.collect()
+            except Exception:
+                pass
+            print("[INFO] CUDA memory cleanup complete.")
 
 
 if __name__ == "__main__":

@@ -348,6 +348,58 @@ class GlyphRasterDataset(Dataset):
         self._preraster_memmap: Optional[np.memmap] = None
         if self.cfg.pre_rasterize:
             total = len(self._rows)
+            # ------------------------------------------------------------------
+            # Enhanced memmap reuse guard:
+            # Before the existing reuse logic below attempts to open an existing
+            # memmap, we verify (if a sidecar meta file exists) that:
+            #   - glyph_count matches
+            #   - SHA1 hash of glyph_id_order matches
+            # If any mismatch is detected we delete the stale memmap so the
+            # standard build path reconstructs it cleanly.
+            # A meta file will be (re)written AFTER successful build (added later).
+            # ------------------------------------------------------------------
+            if self.cfg.pre_raster_mmap and self.cfg.pre_raster_mmap_path:
+                meta_path = self.cfg.pre_raster_mmap_path + ".meta.json"
+                try:
+                    if os.path.isfile(self.cfg.pre_raster_mmap_path) and os.path.isfile(
+                        meta_path
+                    ):
+                        import json, hashlib
+
+                        with open(meta_path, "r", encoding="utf-8") as f:
+                            meta = json.load(f)
+                        expected_count = meta.get("glyph_count")
+                        expected_sha1 = meta.get("glyph_id_order_sha1")
+                        cur_ids = self.glyph_id_order
+                        cur_count = len(cur_ids)
+                        h = hashlib.sha1()
+                        # Stream update for memory friendliness on very large lists
+                        for gid in cur_ids:
+                            h.update(str(gid).encode("utf-8"))
+                            h.update(b",")
+                        cur_sha1 = h.hexdigest()
+                        mismatch = (
+                            expected_count != cur_count or expected_sha1 != cur_sha1
+                        )
+                        if mismatch:
+                            if self.cfg.verbose_stats:
+                                print(
+                                    f"[DATASET] Detected preraster memmap metadata mismatch "
+                                    f"(expected count={expected_count}, current={cur_count}, "
+                                    f"expected sha1={expected_sha1}, current sha1={cur_sha1[:8]}...). "
+                                    "Removing stale cache to force rebuild."
+                                )
+                            try:
+                                os.remove(self.cfg.pre_raster_mmap_path)
+                            except OSError:
+                                pass
+                            try:
+                                os.remove(meta_path)
+                            except OSError:
+                                pass
+                except Exception as e:
+                    if self.cfg.verbose_stats:
+                        print(f"[DATASET] Memmap meta pre-check warning: {e}")
             H = self.cfg.image_size
             W = self.cfg.image_size
             use_uint8 = self.cfg.pre_raster_dtype == "uint8"
@@ -383,6 +435,27 @@ class GlyphRasterDataset(Dataset):
                                     f"[DATASET] Reusing existing preraster memmap '{mmap_path}' sample_sum={float(sample_bytes):.1f}"
                                 )
                             self._preraster_memmap = existing
+                            # Write / refresh meta sidecar on successful reuse
+                            try:
+                                import json, hashlib
+
+                                h = hashlib.sha1()
+                                for gid in self.glyph_id_order:
+                                    h.update(str(gid).encode("utf-8"))
+                                    h.update(b",")
+                                meta = {
+                                    "glyph_count": len(self.glyph_id_order),
+                                    "glyph_id_order_sha1": h.hexdigest(),
+                                }
+                                with open(
+                                    mmap_path + ".meta.json", "w", encoding="utf-8"
+                                ) as mf:
+                                    json.dump(meta, mf)
+                            except Exception as _e:
+                                if self.cfg.verbose_stats:
+                                    print(
+                                        f"[DATASET] Warning: failed to write preraster meta (reuse): {_e}"
+                                    )
                             # Initialize rasterizer (later in normal path) then return early
                             r_cfg = RasterizerConfig(
                                 size=self.cfg.image_size,
@@ -476,6 +549,29 @@ class GlyphRasterDataset(Dataset):
             if mm is not None:
                 mm.flush()
                 self._preraster_memmap = mm
+                # Write meta sidecar for future integrity checks
+                try:
+                    import json, hashlib
+
+                    h = hashlib.sha1()
+                    for gid in self.glyph_id_order:
+                        h.update(str(gid).encode("utf-8"))
+                        h.update(b",")
+                    meta = {
+                        "glyph_count": len(self.glyph_id_order),
+                        "glyph_id_order_sha1": h.hexdigest(),
+                    }
+                    with open(
+                        self.cfg.pre_raster_mmap_path + ".meta.json",
+                        "w",
+                        encoding="utf-8",
+                    ) as mf:
+                        json.dump(meta, mf)
+                except Exception as _e:
+                    if self.cfg.verbose_stats:
+                        print(
+                            f"[DATASET] Warning: failed to write preraster meta (build): {_e}"
+                        )
             else:
                 self._preraster_tensor = torch.stack(imgs, dim=0)
             if self.cfg.verbose_stats:
