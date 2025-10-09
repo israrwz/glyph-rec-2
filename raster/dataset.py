@@ -811,7 +811,10 @@ def make_train_val_split(
         clone._rows = rows
         clone.label_to_index = dataset.label_to_index
         clone.index_to_label = dataset.index_to_label
-        clone.glyph_id_order = [r.glyph_id for r in rows]
+        # IMPORTANT: Preserve original (parent) glyph_id_order so pre-raster index mapping
+        # stays aligned with the cached tensor/memmap. Using a subset-specific ordering
+        # would remap glyph_id -> cache index incorrectly and cause image/label mismatches.
+        clone.glyph_id_order = dataset.glyph_id_order
         clone._cache.clear()
         clone._cache_order.clear()
         return clone
