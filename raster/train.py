@@ -997,29 +997,29 @@ def main(argv=None) -> int:
     cleanup_cuda = args.free_gpu_after and args.device.startswith("cuda")
     model = None
     optimizer = None
-    try:
-        out_base = Path(args.out_dir)
-        checkpoints_dir = out_base / "checkpoints"
-        artifacts_dir = out_base / "artifacts"
-        ensure_dir(checkpoints_dir)
-        ensure_dir(artifacts_dir)
+    # Removed outer try: using explicit cleanup at end instead of try/except-finally
+    out_base = Path(args.out_dir)
+    checkpoints_dir = out_base / "checkpoints"
+    artifacts_dir = out_base / "artifacts"
+    ensure_dir(checkpoints_dir)
+    ensure_dir(artifacts_dir)
 
-        log_path = out_base / args.log_file
-        ensure_dir(log_path.parent)
+    log_path = out_base / args.log_file
+    ensure_dir(log_path.parent)
 
-        print(f"[INFO] Building datasets...")
-        if args.exclude_shaped:
-            print(
-                "[INFO] Shaped label exclusion enabled: rows with '_shaped' in label will be dropped."
-            )
-        # Adjust dataset augment flag based on augment-mode
-        if getattr(args, "augment_mode", "dataset") == "gpu":
-            if not args.no_augment:
-                # Force dataset (per-sample) aug off; we'll do batched GPU aug
-                args.no_augment = True
-        if getattr(args, "augment_mode", "dataset") == "none":
+    print(f"[INFO] Building datasets...")
+    if args.exclude_shaped:
+        print(
+            "[INFO] Shaped label exclusion enabled: rows with '_shaped' in label will be dropped."
+        )
+    # Adjust dataset augment flag based on augment-mode
+    if getattr(args, "augment_mode", "dataset") == "gpu":
+        if not args.no_augment:
+            # Force dataset (per-sample) aug off; we'll do batched GPU aug
             args.no_augment = True
-        # Use stratified split ensuring every label with >=2 samples has at least 1 in training
+    if getattr(args, "augment_mode", "dataset") == "none":
+        args.no_augment = True
+    # Use stratified split ensuring every label with >=2 samples has at least 1 in training
     # and report coverage statistics.
     train_ds, val_ds, train_loader, val_loader = build_loaders(
         args, stratified_min1=True, coverage_report=True
@@ -1334,28 +1334,28 @@ def main(argv=None) -> int:
     )
     print(f"[INFO] Logs written to {log_path}")
     print(f"[INFO] Best checkpoint: {checkpoints_dir / 'best.pt'}")
+    # Explicit cleanup (normal exit path)
+    if cleanup_cuda:
+        print("[INFO] Freeing CUDA memory (finalize)...")
+        try:
+            del model
+        except Exception:
+            pass
+        try:
+            del optimizer
+        except Exception:
+            pass
+        try:
+            if not getattr(args, "no_empty_cache_on_exit", False):
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+        try:
+            gc.collect()
+        except Exception:
+            pass
+        print("[INFO] CUDA memory cleanup complete.")
     return 0
-    finally:
-        if cleanup_cuda:
-            print("[INFO] Freeing CUDA memory (finalize)...")
-            try:
-                del model
-            except Exception:
-                pass
-            try:
-                del optimizer
-            except Exception:
-                pass
-            try:
-                if not getattr(args, "no_empty_cache_on_exit", False):
-                    torch.cuda.empty_cache()
-            except Exception:
-                pass
-            try:
-                gc.collect()
-            except Exception:
-                pass
-            print("[INFO] CUDA memory cleanup complete.")
 
 
 if __name__ == "__main__":
