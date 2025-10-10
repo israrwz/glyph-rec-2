@@ -591,6 +591,8 @@ def build_loaders(
         exclude_shaped=getattr(args, "exclude_shaped", False),
         verbose_stats=True,
         pre_raster_workers=args.pre_raster_workers,
+        fit_mode="tight",
+        hole_strategy="orientation",
     )
     # Instantiate full dataset first
     full_ds = GlyphRasterDataset(ds_cfg)
