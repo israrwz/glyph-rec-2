@@ -514,26 +514,34 @@ class GlyphRasterDataset(Dataset):
                         return (t_local.clamp(0, 1) * 255).to(torch.uint8)
                     return t_local.to(torch.float32)
 
+                # Bounded chunked submission to avoid creating a Future per glyph (memory blow-up at 500k+)
                 with ThreadPoolExecutor(max_workers=self.cfg.pre_raster_workers) as ex:
-                    futures = {
-                        ex.submit(_render, r): i for i, r in enumerate(self._rows)
-                    }
-                    for fut in as_completed(futures):
-                        i = futures[fut]
-                        try:
-                            arr = fut.result()
-                        except Exception:
-                            arr = torch.zeros(
-                                1,
-                                H,
-                                W,
-                                dtype=torch.uint8 if use_uint8 else torch.float32,
-                            )
-                        if mm is not None:
-                            mm[i] = arr.cpu().numpy()
-                        else:
-                            imgs.append(arr)
-                        _report(i)
+                    total_rows_local = len(self._rows)
+                    max_workers = max(1, self.cfg.pre_raster_workers)
+                    # Heuristic: keep at most ~4 * workers tasks in flight
+                    chunk = max_workers * 4
+                    for start in range(0, total_rows_local, chunk):
+                        end = min(total_rows_local, start + chunk)
+                        future_map = {
+                            ex.submit(_render, self._rows[i]): i
+                            for i in range(start, end)
+                        }
+                        for fut in as_completed(future_map):
+                            i = future_map[fut]
+                            try:
+                                arr = fut.result()
+                            except Exception:
+                                arr = torch.zeros(
+                                    1,
+                                    H,
+                                    W,
+                                    dtype=torch.uint8 if use_uint8 else torch.float32,
+                                )
+                            if mm is not None:
+                                mm[i] = arr.cpu().numpy()
+                            else:
+                                imgs.append(arr)
+                            _report(i)
             else:
                 for i, r in enumerate(self._rows):
                     t = self._rasterize(r)
