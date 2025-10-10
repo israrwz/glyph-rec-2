@@ -889,6 +889,16 @@ def train_one_epoch(
             out = model(imgs)
             logits = out["logits"]
             embeddings = out["embedding"]
+            # Debug: verify gradient flow on first batch (helps diagnose frozen backbone / head issues)
+            if batch_idx == 1:
+                if not embeddings.requires_grad:
+                    raise RuntimeError(
+                        "[DEBUG] embeddings tensor does not require grad; check backbone freeze scope or feature hook."
+                    )
+                if not logits.requires_grad:
+                    raise RuntimeError(
+                        "[DEBUG] logits tensor does not require grad; classifier head may be frozen inadvertently."
+                    )
 
         # Classification loss (uses fine-grained labels)
         feats_for_margin = getattr(model, "_last_backbone_features", None)
@@ -1298,13 +1308,31 @@ def main(argv=None) -> int:
                     blur_prob=0.0,
                 )
             )
-        # Backbone freeze (first N epochs)
+        # Backbone freeze (first N epochs) - exclude classifier head & embedding head to keep loss graph valid
         if args.freeze_backbone_epochs > 0:
+            if epoch == 1 and epoch <= args.freeze_backbone_epochs:
+                print(
+                    f"[INFO] Freezing backbone (excluding backbone.head) for {args.freeze_backbone_epochs} epoch(s)."
+                )
             if epoch <= args.freeze_backbone_epochs:
                 for n, p in model.named_parameters():
-                    if n.startswith("backbone.") and p.requires_grad:
+                    # Only freeze true backbone internals; keep backbone.head.* (classifier) and embed_head.* trainable
+                    if (
+                        n.startswith("backbone.")
+                        and not n.startswith("backbone.head")
+                        and p.requires_grad
+                    ):
                         p.requires_grad = False
+                # Safety: ensure classifier head params remain trainable
+                for n, p in model.named_parameters():
+                    if n.startswith("backbone.head") and not p.requires_grad:
+                        p.requires_grad = True
+                # Safety: ensure embedding head trainable
+                for n, p in model.named_parameters():
+                    if n.startswith("embed_head.") and not p.requires_grad:
+                        p.requires_grad = True
             elif epoch == args.freeze_backbone_epochs + 1:
+                print("[INFO] Unfreezing backbone parameters.")
                 for n, p in model.named_parameters():
                     if n.startswith("backbone.") and not p.requires_grad:
                         p.requires_grad = True
