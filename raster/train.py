@@ -266,6 +266,49 @@ def parse_args(argv=None):
         choices=["cosine", "constant"],
         help="LR schedule: 'cosine' (warmup + cosine decay) or 'constant' (flat LR after warmup).",
     )
+    # New enhancement flags
+    ap.add_argument(
+        "--emb-target-weight",
+        type=float,
+        default=0.0,
+        help="Target embedding (contrastive) loss weight after ramp (0 disables ramp entirely).",
+    )
+    ap.add_argument(
+        "--emb-start-epoch",
+        type=int,
+        default=0,
+        help="Epoch (1-based) at which to begin ramping embedding loss weight.",
+    )
+    ap.add_argument(
+        "--emb-ramp-epochs",
+        type=int,
+        default=0,
+        help="Number of epochs over which to linearly ramp embedding loss to target weight.",
+    )
+    ap.add_argument(
+        "--contrastive-grouping",
+        type=str,
+        default="hybrid",
+        choices=["hybrid", "label"],
+        help="Grouping mode for supervised contrastive loss: 'hybrid' (joining_group+char_class) or 'label' (exact label).",
+    )
+    ap.add_argument(
+        "--mild-augment",
+        action="store_true",
+        help="Override to use milder augmentation magnitudes (translate=1, scale=0.03, contrast=0.07, gamma=0.07, no blur).",
+    )
+    ap.add_argument(
+        "--label-smoothing",
+        type=float,
+        default=0.0,
+        help="Apply label smoothing to cross-entropy (e.g. 0.05).",
+    )
+    ap.add_argument(
+        "--freeze-backbone-epochs",
+        type=int,
+        default=0,
+        help="If >0, freeze backbone parameters for the first N epochs (classification head + embedding head still train).",
+    )
     ap.add_argument(
         "--free-gpu-after",
         action="store_true",
@@ -752,6 +795,8 @@ def train_one_epoch(
     scaler: "torch.cuda.amp.GradScaler | None" = None,
     gpu_augment: bool = False,
     gpu_aug_cfg: Dict[str, float] | None = None,
+    label_smoothing: float = 0.0,
+    contrastive_grouping: str = "hybrid",
 ) -> Dict[str, Any]:
     model.train()
     # Accumulate losses on GPU to avoid synchronization
@@ -759,7 +804,11 @@ def train_one_epoch(
     total_ce_loss_tensor = torch.tensor(0.0, device=device)
     total_emb_loss_tensor = torch.tensor(0.0, device=device)
     total_samples = 0
-    ce = nn.CrossEntropyLoss()
+    ce = (
+        nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+        if label_smoothing > 0
+        else nn.CrossEntropyLoss()
+    )
     last_grad_norm = 0.0
     last_unclipped_grad_norm = 0.0
     first_batch_reported = False
@@ -812,6 +861,9 @@ def train_one_epoch(
         imgs = batch["images"].to(device, non_blocking=True)
         labels = batch["labels"].to(device, non_blocking=True)
         joining_groups = batch.get("joining_groups", None)
+        # Override grouping if label-level contrastive specified
+        if contrastive_grouping == "label":
+            joining_groups = None
         if joining_groups is not None:
             joining_groups = joining_groups.to(device, non_blocking=True)
         # Batched GPU augmentation (after move) if enabled
@@ -1216,6 +1268,46 @@ def main(argv=None) -> int:
 
         t0 = time.time()
         # Train
+        # Dynamic embedding loss weight (ramp)
+        if args.emb_target_weight > 0 and epoch >= args.emb_start_epoch:
+            ramp_span = max(1, args.emb_ramp_epochs)
+            # epoch is 1-based in loop
+            ramp_progress = min(
+                1.0,
+                (epoch - args.emb_start_epoch + 1) / ramp_span,
+            )
+            effective_emb_w = args.emb_target_weight * ramp_progress
+        else:
+            effective_emb_w = 0.0
+        # Mild augmentation override (force GPU mild aug)
+        gpu_aug_cfg = dict(
+            translate_px=2,
+            scale_jitter=0.05,
+            contrast_jitter=0.10,
+            gamma_jitter=0.10,
+            blur_prob=0.0,
+            blur_kernel=3,
+        )
+        if args.mild_augment:
+            gpu_aug_cfg.update(
+                dict(
+                    translate_px=1,
+                    scale_jitter=0.03,
+                    contrast_jitter=0.07,
+                    gamma_jitter=0.07,
+                    blur_prob=0.0,
+                )
+            )
+        # Backbone freeze (first N epochs)
+        if args.freeze_backbone_epochs > 0:
+            if epoch <= args.freeze_backbone_epochs:
+                for n, p in model.named_parameters():
+                    if n.startswith("backbone.") and p.requires_grad:
+                        p.requires_grad = False
+            elif epoch == args.freeze_backbone_epochs + 1:
+                for n, p in model.named_parameters():
+                    if n.startswith("backbone.") and not p.requires_grad:
+                        p.requires_grad = True
         train_metrics = train_one_epoch(
             model,
             train_loader,
@@ -1225,18 +1317,14 @@ def main(argv=None) -> int:
             arcface_scale=args.arcface_scale,
             grad_clip=args.grad_clip,
             log_interval=args.log_interval,
-            emb_loss_weight=args.emb_loss_weight,
+            emb_loss_weight=effective_emb_w,
             use_amp=use_amp,
             scaler=scaler,
-            gpu_augment=(getattr(args, "augment_mode", "dataset") == "gpu"),
-            gpu_aug_cfg=dict(
-                translate_px=2,
-                scale_jitter=0.05,
-                contrast_jitter=0.10,
-                gamma_jitter=0.10,
-                blur_prob=0.0,  # disable blur by default in batched path (cost/benefit)
-                blur_kernel=3,
-            ),
+            gpu_augment=(getattr(args, "augment_mode", "dataset") == "gpu")
+            or args.mild_augment,
+            gpu_aug_cfg=gpu_aug_cfg,
+            label_smoothing=args.label_smoothing,
+            contrastive_grouping=args.contrastive_grouping,
         )
         val_stats = validate(model, val_loader, device)
 
@@ -1310,7 +1398,7 @@ def main(argv=None) -> int:
             f"(abs_epoch={epoch}) "
             f"train_loss={train_metrics['train_loss']:.4f} "
             f"ce_loss={train_metrics.get('ce_loss', 0.0):.4f} "
-            f"emb_loss={train_metrics.get('emb_loss', 0.0):.4f} "
+            f"emb_loss={train_metrics.get('emb_loss', 0.0):.4f} (eff_emb_w={effective_emb_w:.4f}) "
             f"val_loss={val_stats['val_loss']:.4f} "
             f"val_acc={val_stats['val_accuracy']:.4f} "
             f"grad_norm={train_metrics['grad_norm']:.2f} "
