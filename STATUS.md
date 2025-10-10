@@ -441,6 +441,21 @@ python -m raster.train \
 
 ## 📝 Important Notes
 
+### Recent Training Pipeline Enhancements (Embedding Ramp & Adaptive Scheduling)
+- Embedding Ramp: dynamic weight now specified via `--emb-target-weight`, `--emb-start-epoch`, `--emb-ramp-epochs`. Effective weight logged each epoch as `(eff_emb_w=...)`. This replaces the formerly static `--emb-loss-weight` usage during early epochs.
+- Grouping Mode & Switch: initial supervised contrastive grouping can be forced to fine-grained `label` (`--contrastive-grouping label`) and later auto-switch to `hybrid` (joining_group + char_class) at `--grouping-switch-epoch N` to first separate exact classes, then encourage broader semantic clustering for retrieval.
+- Adaptive Embedding Weight Decay: optional (`--adaptive-emb-patience`, `--adaptive-emb-decay`, `--adaptive-emb-min-weight`) monitors validation accuracy after ramp completion; if no improvement for a patience window, the target embedding weight decays (never below the configured floor). Helps prevent contrastive dominance in very long (200 epoch) full runs.
+- Head LR Bump: one-time multiplicative bump of classification head learning rate at `--head-lr-bump-epoch` with factor `--head-lr-bump-factor` to re-energize class separation after ramp / early plateau.
+- Backbone Freeze Warmup: `--freeze-backbone-epochs K` freezes backbone *excluding* `backbone.head` and `embed_head` so early ramped embedding / head layers stabilize without large backbone drift.
+- Debug Noise Removed: verbose per-batch debug prints (`[DEBUG] contrastive positives ...`, `[DEBUG] first batch shape=...`) removed for cleaner long-run logs; integrity & ramp info retained.
+- Banner Accuracy: startup banner now shows ramp parameters, grouping mode, planned grouping switch, adaptive decay settings, and head LR bump schedule (legacy "Embedding loss weight: 0.3" line removed to avoid confusion).
+- Scaling Guidance (531k / 200 epochs): 
+  * Suggested initial config: freeze backbone first 4–6 epochs, ramp embedding over ~10–12 epochs (≈5% of total), target weight 0.04–0.06, schedule cosine LR with warmup_frac 0.05–0.08. 
+  * Enable adaptive decay with patience ≈ 12–16 epochs post-ramp; decay factor 0.85–0.9; min weight 0.015–0.02.
+  * Optional head LR bump around epoch ~ (ramp_end + patience/2) if val accuracy plateaus.
+- Rationale: These adjustments corrected earlier early-epoch contrastive dominance (which slowed classification lift) and improved stability when moving from 20k slice (367 classes, best top-1 ≈38%) to 100k slice (996 classes, top-1 ≈21.7% under ramped label-grouping). Expect further gains with adaptive decay and grouping switch on full 531k set.
+
+
 ### Why Previous Runs Failed
 1. **10k-16k samples insufficient** for 800-900 classes
 2. Only ~15 samples per class → severe overfitting

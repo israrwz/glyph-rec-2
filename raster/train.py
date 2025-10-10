@@ -280,6 +280,42 @@ def parse_args(argv=None):
         help="Epoch (1-based) at which to begin ramping embedding loss weight.",
     )
     ap.add_argument(
+        "--grouping-switch-epoch",
+        type=int,
+        default=0,
+        help="If >0, switch contrastive grouping mode to 'hybrid' at this (1-based) epoch (after ramp start logic).",
+    )
+    ap.add_argument(
+        "--adaptive-emb-patience",
+        type=int,
+        default=0,
+        help="If >0, monitor val_acc; if no improvement for this many epochs after ramp completion, decay embedding weight.",
+    )
+    ap.add_argument(
+        "--adaptive-emb-decay",
+        type=float,
+        default=0.8,
+        help="Multiplicative decay applied to current embedding target weight when patience triggers.",
+    )
+    ap.add_argument(
+        "--adaptive-emb-min-weight",
+        type=float,
+        default=0.01,
+        help="Lower bound for adaptive embedding weight after decays.",
+    )
+    ap.add_argument(
+        "--head-lr-bump-epoch",
+        type=int,
+        default=0,
+        help="If >0, bump classification head LR at this epoch (after LR schedule update).",
+    )
+    ap.add_argument(
+        "--head-lr-bump-factor",
+        type=float,
+        default=1.3,
+        help="Multiplicative factor for head LR bump.",
+    )
+    ap.add_argument(
         "--emb-ramp-epochs",
         type=int,
         default=0,
@@ -933,10 +969,8 @@ def train_one_epoch(
                     lbl_eq.fill_diagonal_(False)
                     pos_counts = lbl_eq.sum(dim=1)
                     if pos_counts.numel() > 0:
-                        print(
-                            f"[DEBUG] contrastive positives: min={int(pos_counts.min().item())} "
-                            f"mean={pos_counts.float().mean().item():.2f}"
-                        )
+                        # (debug contrastive positives removed)
+                        pass
 
         # Combined loss
         loss = ce_loss + emb_loss_weight * emb_loss
@@ -999,11 +1033,8 @@ def train_one_epoch(
     # Print first batch stats after loop (sync once)
     if "first_batch_stats" in locals():
         s = first_batch_stats
-        print(
-            f"[DEBUG] first batch shape={s['shape']}, "
-            f"min={s['min'].item():.4f}, max={s['max'].item():.4f}, mean={s['mean'].item():.4f}, "
-            f"nonzero_px={s['nonzero'].item()}/{s['numel']}"
-        )
+        # (debug first batch stats removed)
+        pass
 
     # Only sync to CPU at epoch end
     return {
@@ -1190,12 +1221,26 @@ def main(argv=None) -> int:
     print(
         f"  - Samples per class (avg): {len(train_ds) / len(train_ds.label_to_index):.1f}"
     )
-    print(f"  - Embedding loss weight: {args.emb_loss_weight}")
-    if args.emb_loss_weight > 0.0:
-        print(f"  - Contrastive grouping: HYBRID (joining_group + char_class)")
-        print(f"    • Arabic letters: grouped by joining_group (BEH, HAH, etc.)")
-        print(f"    • NO_JOIN glyphs: grouped by char_class (latin, diacritic, etc.)")
-        print(f"    • Prevents mixing Latin/diacritic/punctuation in embeddings")
+    print(
+        f"  - Embedding ramp: target={args.emb_target_weight} start_epoch={args.emb_start_epoch} ramp_epochs={args.emb_ramp_epochs}"
+    )
+    if args.grouping_switch_epoch and args.grouping_switch_epoch > 0:
+        print(
+            f"  - Contrastive grouping mode: {args.contrastive_grouping.upper()} (will switch to HYBRID at epoch {args.grouping_switch_epoch})"
+        )
+    else:
+        print(f"  - Contrastive grouping mode: {args.contrastive_grouping.upper()}")
+    print(f"    • Arabic letters: grouped by joining_group (BEH, HAH, etc.)")
+    print(f"    • NO_JOIN glyphs: grouped by char_class (latin, diacritic, etc.)")
+    print(f"    • Prevents mixing Latin/diacritic/punctuation in embeddings")
+    if args.adaptive_emb_patience > 0:
+        print(
+            f"  - Adaptive emb weight decay enabled (patience={args.adaptive_emb_patience}, decay={args.adaptive_emb_decay}, floor={args.adaptive_emb_min_weight})"
+        )
+    if args.head_lr_bump_epoch > 0:
+        print(
+            f"  - Head LR bump scheduled at epoch {args.head_lr_bump_epoch} (factor={args.head_lr_bump_factor})"
+        )
     if args.emb_loss_weight == 0.0:
         print(f"    WARNING: Embedding loss disabled (weight=0.0)")
 
@@ -1289,6 +1334,64 @@ def main(argv=None) -> int:
             effective_emb_w = args.emb_target_weight * ramp_progress
         else:
             effective_emb_w = 0.0
+
+        # Grouping switch (label -> hybrid) after specified epoch
+        if (
+            args.grouping_switch_epoch
+            and args.grouping_switch_epoch > 0
+            and epoch >= args.grouping_switch_epoch
+            and args.contrastive_grouping == "label"
+        ):
+            args.contrastive_grouping = "hybrid"
+
+        # Adaptive embedding weight decay (after ramp complete)
+        if not hasattr(main, "_adaptive_tracker"):
+            main._adaptive_tracker = {
+                "best_val": -1.0,
+                "last_improve_epoch": epoch,
+                "current_target": args.emb_target_weight,
+            }
+        tracker = main._adaptive_tracker
+        ramp_complete_epoch = (
+            args.emb_start_epoch + args.emb_ramp_epochs - 1
+            if args.emb_target_weight > 0
+            else 0
+        )
+        if val_stats := locals().get("val_stats"):
+            current_val = val_stats.get("val_accuracy", -1.0)
+            if current_val > tracker["best_val"] + 1e-6:
+                tracker["best_val"] = current_val
+                tracker["last_improve_epoch"] = epoch
+            # Check patience only after ramp completion
+            if (
+                args.adaptive_emb_patience > 0
+                and epoch > ramp_complete_epoch
+                and (epoch - tracker["last_improve_epoch"])
+                >= args.adaptive_emb_patience
+                and tracker["current_target"] > args.adaptive_emb_min_weight
+            ):
+                tracker["current_target"] = max(
+                    args.adaptive_emb_min_weight,
+                    tracker["current_target"] * args.adaptive_emb_decay,
+                )
+                if effective_emb_w > 0:
+                    # Rescale current effective weight proportionally
+                    effective_emb_w = min(effective_emb_w, tracker["current_target"])
+                print(
+                    f"[ADAPT] Embedding weight decayed to target={tracker['current_target']:.4f} (no val_acc improvement for {args.adaptive_emb_patience} epochs)."
+                )
+
+        # Head LR bump (applied once)
+        if (
+            args.head_lr_bump_epoch > 0
+            and epoch == args.head_lr_bump_epoch
+            and len(optimizer.param_groups) >= 2
+        ):
+            old_head_lr = optimizer.param_groups[1]["lr"]
+            optimizer.param_groups[1]["lr"] = old_head_lr * args.head_lr_bump_factor
+            print(
+                f"[LR-BUMP] Head LR bumped from {old_head_lr:.6f} to {optimizer.param_groups[1]['lr']:.6f}"
+            )
         # Mild augmentation override (force GPU mild aug)
         gpu_aug_cfg = dict(
             translate_px=2,
